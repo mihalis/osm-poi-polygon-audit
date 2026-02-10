@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# Generated data files (large, reproducible from pipeline)
+data/
+
+# macOS resource forks
+._*
+.DS_Store
+
+# Claude Code project files
+.claude/
+
+# Environment / secrets
+.env
