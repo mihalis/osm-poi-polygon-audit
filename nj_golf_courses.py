@@ -1,8 +1,11 @@
 """
-NJ Golf Course Mapper & Validator
+Configurable POI Pipeline — OSM + Foursquare Mapper & Validator
 
-Fetches golf course data from OpenStreetMap, cross-validates with Foursquare
-and web sources, produces interactive maps and summary reports.
+Fetches point-of-interest polygons from OpenStreetMap, cross-validates with
+Foursquare, and produces interactive maps and summary reports.
+
+By default, the pipeline targets NJ golf courses, but behavior is fully
+configurable via the PipelineConfig dataclass.
 """
 
 import json
@@ -10,27 +13,62 @@ import math
 import os
 import re
 import sys
-import time
 import warnings
+from dataclasses import dataclass, field
 
 import duckdb
 import folium
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 import requests
 from branca.element import Template, MacroElement
-from bs4 import BeautifulSoup
-from shapely.geometry import Point, shape
-from shapely.ops import unary_union
 from shapely.validation import make_valid
-from sklearn.ensemble import GradientBoostingClassifier
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 MAPBOX_TOKEN = os.environ.get("MAPBOX_ACCESS_TOKEN", "")
-UTM_CRS = "EPSG:32618"  # UTM Zone 18N for NJ
+
+
+@dataclass
+class PipelineConfig:
+    osm_tag: str = "leisure"
+    osm_value: str = "golf_course"
+    keyword: str = "Golf Course"
+    exclude_keywords: list = field(default_factory=lambda: ["Mini Golf", "Miniature Golf", "Minigolf"])
+    state_name: str = "New Jersey"
+    state_abbrev: str = "NJ"
+
+    @property
+    def file_prefix(self):
+        kw = self.keyword.lower().replace(" ", "_") + "s"
+        return f"{self.state_abbrev.lower()}_{kw}"
+
+    @property
+    def display_name(self):
+        return f"{self.state_name} {self.keyword}s"
+
+    @property
+    def unknown_name(self):
+        return f"Unknown {self.keyword}"
+
+    @property
+    def utm_crs(self):
+        state_centroids = {
+            "NJ": -74.4, "NY": -75.5, "PA": -77.2, "CT": -72.7,
+            "CA": -119.4, "TX": -99.9, "FL": -81.5, "IL": -89.4,
+            "OH": -82.8, "GA": -83.6, "NC": -79.8, "MI": -84.5,
+            "VA": -78.5, "WA": -120.7, "AZ": -111.1, "MA": -71.5,
+            "TN": -86.6, "IN": -86.1, "MO": -91.8, "MD": -76.6,
+            "WI": -89.6, "CO": -105.8, "MN": -94.6, "SC": -81.0,
+            "AL": -86.9, "LA": -91.9, "KY": -84.3, "OR": -120.6,
+        }
+        lon = state_centroids.get(self.state_abbrev, -74.4)
+        zone = int((lon + 180) / 6) + 1
+        return f"EPSG:326{zone:02d}"
+
+    def file_path(self, suffix):
+        return f"{self.file_prefix}_{suffix}"
 
 
 def _make_hexagon(lat, lon, radius_m=75):
@@ -57,20 +95,22 @@ def _count_polygon_vertices(geojson_geom):
     return 0
 
 
-def fetch_osm_golf_courses():
-    """Fetch golf course polygons from OpenStreetMap via Overpass API."""
-    print("[1/7] Fetching golf course polygons from OpenStreetMap...")
+def fetch_osm_golf_courses(config=None):
+    """Fetch POI polygons from OpenStreetMap via Overpass API."""
+    if config is None:
+        config = PipelineConfig()
+    print(f"[1/5] Fetching {config.keyword.lower()} polygons from OpenStreetMap...")
 
     overpass_servers = [
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
     ]
-    query = """
+    query = f"""
     [out:json][timeout:300];
-    area["name"="New Jersey"]["admin_level"="4"]->.nj;
+    area["name"="{config.state_name}"]["admin_level"="4"]->.searchArea;
     (
-      way["leisure"="golf_course"](area.nj);
-      relation["leisure"="golf_course"](area.nj);
+      way["{config.osm_tag}"="{config.osm_value}"](area.searchArea);
+      relation["{config.osm_tag}"="{config.osm_value}"](area.searchArea);
     );
     out body;
     >;
@@ -126,7 +166,7 @@ def fetch_osm_golf_courses():
             coords.append(coords[0])
             nids.append(nids[0])
 
-        name = way.get("tags", {}).get("name", "Unknown Golf Course")
+        name = way.get("tags", {}).get("name", config.unknown_name)
         tags = way.get("tags", {})
 
         feature = {
@@ -144,7 +184,7 @@ def fetch_osm_golf_courses():
 
     # Process relations (multipolygon)
     for rel_id, rel in relations.items():
-        name = rel.get("tags", {}).get("name", "Unknown Golf Course")
+        name = rel.get("tags", {}).get("name", config.unknown_name)
         tags = rel.get("tags", {})
 
         outer_rings = []
@@ -207,19 +247,21 @@ def fetch_osm_golf_courses():
 
     geojson = {"type": "FeatureCollection", "features": features}
 
-    geojson_path = os.path.join(DATA_DIR, "nj_golf_courses.geojson")
+    geojson_path = os.path.join(DATA_DIR, config.file_path("data.geojson"))
     with open(geojson_path, "w") as f:
         json.dump(geojson, f, indent=2)
 
     gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
-    print(f"  Found {len(gdf)} golf courses from OpenStreetMap.")
+    print(f"  Found {len(gdf)} {config.keyword.lower()}s from OpenStreetMap.")
     print(f"  Saved to {geojson_path}")
     return gdf
 
 
-def fetch_foursquare_golf_courses():
-    """Fetch golf course POIs from Foursquare Open Source Places via S3/DuckDB."""
-    print("[2/7] Fetching golf course data from Foursquare OS Places (S3)...")
+def fetch_foursquare_golf_courses(config=None):
+    """Fetch POIs from Foursquare Open Source Places via S3/DuckDB."""
+    if config is None:
+        config = PipelineConfig()
+    print(f"[2/5] Fetching {config.keyword.lower()} data from Foursquare OS Places (S3)...")
 
     s3_path = "s3://fsq-os-places-us-east-1/release/dt=2025-09-09/places/parquet/**/*.parquet"
 
@@ -233,19 +275,25 @@ def fetch_foursquare_golf_courses():
     print("  Querying Foursquare OS Places parquet files from S3...")
     print("  (This scans ~11GB of data remotely, may take a few minutes)")
 
+    # Build exclude clauses dynamically
+    exclude_clauses = []
+    for ek in config.exclude_keywords:
+        ek_lower = ek.lower()
+        exclude_clauses.append(
+            f"AND lower(array_to_string(fsq_category_labels, '|')) NOT LIKE '%{ek_lower}%'"
+        )
+        exclude_clauses.append(f"AND lower(name) NOT LIKE '%{ek_lower}%'")
+    exclude_sql = "\n          ".join(exclude_clauses)
+
     df = con.execute(f"""
         SELECT fsq_place_id, name, latitude, longitude, address, locality,
                region, fsq_category_labels, date_closed
         FROM read_parquet('{s3_path}')
         WHERE country = 'US'
-          AND region = 'NJ'
+          AND region = '{config.state_abbrev}'
           AND fsq_category_labels IS NOT NULL
-          AND lower(array_to_string(fsq_category_labels, '|')) LIKE '%golf course%'
-          AND lower(array_to_string(fsq_category_labels, '|')) NOT LIKE '%mini golf%'
-          AND lower(array_to_string(fsq_category_labels, '|')) NOT LIKE '%miniature golf%'
-          AND lower(name) NOT LIKE '%mini golf%'
-          AND lower(name) NOT LIKE '%miniature golf%'
-          AND lower(name) NOT LIKE '%minigolf%'
+          AND lower(array_to_string(fsq_category_labels, '|')) LIKE '%{config.keyword.lower()}%'
+          {exclude_sql}
     """).fetchdf()
 
     con.close()
@@ -255,20 +303,22 @@ def fetch_foursquare_golf_courses():
         lambda x: "; ".join(x) if isinstance(x, list) else str(x)
     )
 
-    fsq_path = os.path.join(DATA_DIR, "foursquare_golf_courses.parquet")
+    fsq_path = os.path.join(DATA_DIR, f"foursquare_{config.file_prefix}.parquet")
     df.to_parquet(fsq_path, index=False)
-    print(f"  Found {len(df)} golf courses from Foursquare OS Places.")
+    print(f"  Found {len(df)} {config.keyword.lower()}s from Foursquare OS Places.")
     print(f"  Saved to {fsq_path}")
     return df
 
 
-def validate_with_foursquare(osm_gdf, fsq_df):
+def validate_with_foursquare(osm_gdf, fsq_df, config=None):
     """Cross-validate OSM polygons against Foursquare points."""
-    print("[3/7] Cross-validating OSM data with Foursquare...")
+    if config is None:
+        config = PipelineConfig()
+    print("[3/5] Cross-validating OSM data with Foursquare...")
 
     if fsq_df.empty:
         print("  No Foursquare data available. Generating OSM-only report.")
-        osm_projected = osm_gdf.to_crs(UTM_CRS)
+        osm_projected = osm_gdf.to_crs(config.utm_crs)
         records = []
         for idx, row in osm_gdf.iterrows():
             area = osm_projected.geometry.iloc[
@@ -288,13 +338,13 @@ def validate_with_foursquare(osm_gdf, fsq_df):
                 }
             )
         result = pd.DataFrame(records)
-        report_path = os.path.join(DATA_DIR, "foursquare_validation_report.csv")
+        report_path = os.path.join(DATA_DIR, config.file_path("validation_report.csv"))
         result.to_csv(report_path, index=False)
         print(f"  Saved validation report to {report_path}")
         print(f"  Summary: {len(records)} OSM-only, 0 Foursquare-only, 0 matched")
         return result
 
-    osm_projected = osm_gdf.to_crs(UTM_CRS)
+    osm_projected = osm_gdf.to_crs(config.utm_crs)
     # Fix invalid geometries
     osm_projected["geometry"] = osm_projected.geometry.apply(
         lambda g: make_valid(g) if not g.is_valid else g
@@ -307,7 +357,7 @@ def validate_with_foursquare(osm_gdf, fsq_df):
         geometry=gpd.points_from_xy(fsq_valid["longitude"], fsq_valid["latitude"]),
         crs="EPSG:4326",
     )
-    fsq_projected = fsq_gdf.to_crs(UTM_CRS)
+    fsq_projected = fsq_gdf.to_crs(config.utm_crs)
 
     records = []
     matched_fsq_ids = set()
@@ -451,7 +501,7 @@ def validate_with_foursquare(osm_gdf, fsq_df):
         print(f"  Reclassified {reclassified_count} Foursquare-only POIs as verified (inside OSM polygons)")
 
     result = pd.DataFrame(records)
-    report_path = os.path.join(DATA_DIR, "foursquare_validation_report.csv")
+    report_path = os.path.join(DATA_DIR, config.file_path("validation_report.csv"))
     result.to_csv(report_path, index=False)
 
     matched = result[result["foursquare_match"] == True]
@@ -467,806 +517,24 @@ def validate_with_foursquare(osm_gdf, fsq_df):
     return result
 
 
-def fetch_nj_landcover():
-    """Fetch green/natural land cover polygons for NJ from Overpass API."""
-    print("  Fetching NJ green land cover data from OpenStreetMap...")
 
-    overpass_servers = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-    ]
-    query = """
-    [out:json][timeout:300];
-    area["name"="New Jersey"]["admin_level"="4"]->.nj;
-    (
-      way["landuse"~"^(forest|farmland|grass|meadow|recreation_ground|orchard|vineyard)$"](area.nj);
-      way["leisure"~"^(park|garden|nature_reserve)$"](area.nj);
-      way["natural"~"^(wood|scrub|grassland|heath)$"](area.nj);
-    );
-    out geom;
-    """
 
-    data = None
-    for url in overpass_servers:
-        try:
-            print(f"    Trying {url}...")
-            resp = requests.post(url, data={"data": query}, timeout=360)
-            resp.raise_for_status()
-            data = resp.json()
-            print(f"    Success ({len(data.get('elements', []))} elements)")
-            break
-        except Exception as e:
-            print(f"    Failed: {e}")
 
-    if data is None:
-        return None
 
-    features = []
-    for el in data.get("elements", []):
-        if el["type"] != "way" or "geometry" not in el:
-            continue
-        coords = [(p["lon"], p["lat"]) for p in el["geometry"]]
-        if len(coords) < 3:
-            continue
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-        tags = el.get("tags", {})
-        cat = tags.get("landuse") or tags.get("leisure") or tags.get("natural") or "unknown"
-        features.append({
-            "type": "Feature",
-            "properties": {"category": cat},
-            "geometry": {"type": "Polygon", "coordinates": [coords]},
-        })
 
-    if not features:
-        return None
 
-    gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
-    print(f"  Fetched {len(gdf)} green/natural land cover polygons.")
-    return gdf
 
 
-def validate_foursquare_only(osm_gdf, fsq_validation):
-    """Score Foursquare-only POIs by likelihood of being actual golf courses.
 
-    Uses surrounding land cover (green vs urban) to predict whether a
-    Foursquare-only point is a real golf course. Trains a model on verified
-    OSM+Foursquare golf course centroids as positive examples.
-    """
-    print("[3b/7] Validating Foursquare-only POIs with land cover analysis...")
 
-    fsq_only_mask = fsq_validation["match_method"] == "foursquare_only"
-    n_fsq_only = fsq_only_mask.sum()
-
-    # Initialize golf_probability column
-    fsq_validation["golf_probability"] = np.nan
-    fsq_validation.loc[fsq_validation["foursquare_match"] == True, "golf_probability"] = 1.0
-    fsq_validation.loc[
-        (fsq_validation["match_method"] == "none") & (fsq_validation["osm_id"] != ""),
-        "golf_probability",
-    ] = 1.0  # OSM-only courses are real courses too
-
-    if n_fsq_only == 0:
-        print("  No Foursquare-only POIs to validate.")
-        return fsq_validation
-
-    # Fetch green land cover for NJ
-    landcover_gdf = fetch_nj_landcover()
-
-    if landcover_gdf is None or landcover_gdf.empty:
-        print("  Land cover data unavailable. Setting default probability.")
-        fsq_validation.loc[fsq_only_mask, "golf_probability"] = 0.5
-        return fsq_validation
-
-    # Project land cover and fix invalid geometries
-    lc_proj = landcover_gdf.to_crs(UTM_CRS)
-    lc_proj["geometry"] = lc_proj.geometry.apply(
-        lambda g: make_valid(g) if g and not g.is_empty and not g.is_valid else g
-    )
-    lc_proj = lc_proj[~lc_proj.geometry.is_empty & lc_proj.geometry.notna()]
-
-    sindex = lc_proj.sindex
-    BUFFER_M = 500
-    buffer_area = np.pi * BUFFER_M ** 2
-
-    def compute_features(lat, lon):
-        """Compute land cover features within 500m buffer around a point."""
-        try:
-            pt_proj = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(UTM_CRS)[0]
-            buf = pt_proj.buffer(BUFFER_M)
-            candidates_idx = list(sindex.intersection(buf.bounds))
-            if not candidates_idx:
-                return [0.0, 0.0, 0]
-            candidates = lc_proj.iloc[candidates_idx]
-            hits = candidates[candidates.intersects(buf)]
-            if hits.empty:
-                return [0.0, 0.0, 0]
-            clipped = hits.intersection(buf)
-            areas = clipped.area
-            green_ratio = min(areas.sum() / buffer_area, 1.0)
-            max_patch_ratio = min(areas.max() / buffer_area, 1.0)
-            patch_count = len(areas)
-            return [green_ratio, max_patch_ratio, patch_count]
-        except Exception:
-            return [0.0, 0.0, 0]
-
-    # Positive examples: centroids of verified OSM golf course polygons
-    print("  Computing features for verified golf courses (positive examples)...")
-    osm_proj = osm_gdf.to_crs(UTM_CRS)
-    osm_proj["geometry"] = osm_proj.geometry.apply(
-        lambda g: make_valid(g) if not g.is_valid else g
-    )
-
-    verified_osm_ids = set(
-        fsq_validation[fsq_validation["foursquare_match"] == True]["osm_id"].values
-    )
-
-    pos_features = []
-    for idx, row in osm_gdf.iterrows():
-        if row.get("osm_id", "") in verified_osm_ids:
-            c = row.geometry.centroid
-            pos_features.append(compute_features(c.y, c.x))
-    print(f"    {len(pos_features)} positive examples computed")
-
-    # Negative examples: random points in NJ far from any golf course
-    print("  Generating negative training examples...")
-    np.random.seed(42)
-    bounds = osm_gdf.total_bounds  # minx, miny, maxx, maxy
-
-    neg_features = []
-    target_neg = min(len(pos_features), 200)
-    attempts = 0
-    while len(neg_features) < target_neg and attempts < 3000:
-        rlon = np.random.uniform(bounds[0], bounds[2])
-        rlat = np.random.uniform(bounds[1], bounds[3])
-        rpt = gpd.GeoSeries([Point(rlon, rlat)], crs="EPSG:4326").to_crs(UTM_CRS)[0]
-        min_dist = osm_proj.geometry.distance(rpt).min()
-        if min_dist > 2000:  # At least 2km from any golf course
-            neg_features.append(compute_features(rlat, rlon))
-        attempts += 1
-    print(f"    {len(neg_features)} negative examples computed")
-
-    if len(pos_features) < 10 or len(neg_features) < 10:
-        print("  Not enough training data. Setting default probability.")
-        fsq_validation.loc[fsq_only_mask, "golf_probability"] = 0.5
-        return fsq_validation
-
-    # Train model
-    print(f"  Training GradientBoosting model...")
-    X = np.array(pos_features + neg_features)
-    y = np.array([1] * len(pos_features) + [0] * len(neg_features))
-
-    model = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
-    model.fit(X, y)
-    train_acc = model.score(X, y)
-    print(f"    Training accuracy: {train_acc:.1%}")
-    print(f"    Feature importances: green_ratio={model.feature_importances_[0]:.2f}, "
-          f"max_patch={model.feature_importances_[1]:.2f}, "
-          f"patch_count={model.feature_importances_[2]:.2f}")
-
-    # Score FSQ-only POIs
-    print(f"  Scoring {n_fsq_only} Foursquare-only POIs...")
-    fsq_only_indices = fsq_validation.index[fsq_only_mask]
-    probs = []
-    for i, idx in enumerate(fsq_only_indices):
-        row = fsq_validation.loc[idx]
-        lat = row.get("foursquare_latitude")
-        lon = row.get("foursquare_longitude")
-        if pd.notna(lat) and pd.notna(lon):
-            feats = compute_features(lat, lon)
-            prob = model.predict_proba(np.array([feats]))[0][1]
-        else:
-            prob = 0.0
-        probs.append(prob)
-        if (i + 1) % 100 == 0:
-            print(f"    Scored {i + 1}/{n_fsq_only}...")
-
-    fsq_validation.loc[fsq_only_indices, "golf_probability"] = probs
-
-    likely = sum(1 for p in probs if p >= 0.5)
-    print(f"  Results: {likely} likely golf courses, {n_fsq_only - likely} unlikely")
-
-    # Save updated report
-    report_path = os.path.join(DATA_DIR, "foursquare_validation_report.csv")
-    fsq_validation.to_csv(report_path, index=False)
-    print(f"  Updated {report_path}")
-
-    return fsq_validation
-
-
-def _fetch_buildings_around_points(query_points, radius_m):
-    """Fetch building center points from Overpass in batches.
-
-    Args:
-        query_points: list of (lat, lon) tuples
-        radius_m: search radius in meters
-
-    Returns:
-        dict mapping osm_id -> (lat, lon) for deduplicated building centers
-    """
-    overpass_servers = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-    ]
-    BATCH_SIZE = 10
-    all_buildings = {}  # osm_id -> (lat, lon)
-
-    batches = [
-        query_points[i : i + BATCH_SIZE]
-        for i in range(0, len(query_points), BATCH_SIZE)
-    ]
-
-    for batch_idx, batch in enumerate(batches):
-        around_parts = "\n".join(
-            f'way["building"](around:{radius_m},{lat},{lon});'
-            for lat, lon in batch
-        )
-        query = f"""
-        [out:json][timeout:180];
-        (
-          {around_parts}
-        );
-        out center qt;
-        """
-
-        success = False
-        for url in overpass_servers:
-            try:
-                resp = requests.post(url, data={"data": query}, timeout=240)
-                resp.raise_for_status()
-                data = resp.json()
-                for el in data.get("elements", []):
-                    if "center" in el:
-                        all_buildings[el["id"]] = (
-                            el["center"]["lat"],
-                            el["center"]["lon"],
-                        )
-                success = True
-                break
-            except Exception as e:
-                if url == overpass_servers[-1]:
-                    print(f"    Batch {batch_idx + 1}: all servers failed - {e}")
-                continue
-
-        time.sleep(1.5)
-        if (batch_idx + 1) % 10 == 0:
-            print(
-                f"    Fetched {batch_idx + 1}/{len(batches)} batches "
-                f"({len(all_buildings)} buildings so far)..."
-            )
-
-    return all_buildings
-
-
-def validate_foursquare_only_v2(osm_gdf, fsq_validation, fsq_df):
-    """V2: Score FSQ-only POIs using building-free directional ellipse search.
-
-    Approach:
-    1. Learn typical golf course geometry from verified OSM+Foursquare matches
-       (area, aspect ratio, POI position relative to polygon).
-    2. Fetch building footprints around each POI from Overpass.
-    3. For each FSQ-only POI, try placing an ellipse of typical golf course
-       size in 16 directions. The POI sits at the edge of the ellipse (since
-       the clubhouse is typically at the course boundary). Count buildings
-       inside each candidate ellipse.
-    4. Score based on the minimum building count found (fewer = more likely
-       to be a real golf course).
-    """
-    print("=" * 60)
-    print("[V2] Building-based directional ellipse validation")
-    print("=" * 60)
-
-    fsq_only_mask = fsq_validation["match_method"] == "foursquare_only"
-    n_fsq_only = fsq_only_mask.sum()
-
-    # Initialize v2 probability column
-    fsq_validation["golf_probability_v2"] = np.nan
-    fsq_validation.loc[
-        fsq_validation["foursquare_match"] == True, "golf_probability_v2"
-    ] = 1.0
-    fsq_validation.loc[
-        (fsq_validation["match_method"] == "none")
-        & (fsq_validation["osm_id"] != ""),
-        "golf_probability_v2",
-    ] = 1.0
-
-    if n_fsq_only == 0:
-        print("  No Foursquare-only POIs to validate.")
-        return fsq_validation
-
-    # === Phase 1: Learn golf course geometry from verified matches ===
-    print("\n  Phase 1: Learning golf course geometry from verified matches...")
-
-    osm_proj = osm_gdf.to_crs(UTM_CRS)
-    osm_proj["geometry"] = osm_proj.geometry.apply(
-        lambda g: make_valid(g) if not g.is_valid else g
-    )
-
-    # Get FSQ coordinates for verified courses
-    fsq_coords = fsq_df[["fsq_place_id", "latitude", "longitude"]].copy()
-    fsq_coords = fsq_coords.dropna(subset=["latitude", "longitude"])
-
-    verified = fsq_validation[fsq_validation["foursquare_match"] == True].copy()
-
-    areas = []
-    aspect_ratios = []
-    poi_offsets = []  # distance from POI to polygon centroid
-
-    for _, v_row in verified.iterrows():
-        osm_id = v_row["osm_id"]
-        fsq_id = v_row["foursquare_fsq_place_id"]
-        fsq_match = fsq_coords[fsq_coords["fsq_place_id"] == fsq_id]
-        if fsq_match.empty:
-            continue
-        lat, lon = fsq_match.iloc[0]["latitude"], fsq_match.iloc[0]["longitude"]
-
-        osm_rows = osm_gdf[osm_gdf["osm_id"] == osm_id]
-        if osm_rows.empty:
-            continue
-        loc = osm_gdf.index.get_loc(osm_rows.index[0])
-        poly = osm_proj.geometry.iloc[loc]
-        if poly is None or poly.is_empty:
-            continue
-
-        poi = gpd.GeoSeries(
-            [Point(lon, lat)], crs="EPSG:4326"
-        ).to_crs(UTM_CRS)[0]
-
-        areas.append(poly.area)
-        poi_offsets.append(poly.centroid.distance(poi))
-
-        b = poly.bounds
-        dx, dy = b[2] - b[0], b[3] - b[1]
-        if min(dx, dy) > 0:
-            aspect_ratios.append(max(dx, dy) / min(dx, dy))
-
-    if len(areas) < 10:
-        print("  Not enough verified course geometry. Skipping v2.")
-        fsq_validation.loc[fsq_only_mask, "golf_probability_v2"] = 0.5
-        return fsq_validation
-
-    median_area = np.median(areas)
-    median_aspect = np.median(aspect_ratios) if aspect_ratios else 1.5
-    median_offset = np.median(poi_offsets)
-
-    # Ellipse semi-axes from learned geometry
-    semi_major = np.sqrt(median_area * median_aspect / np.pi)
-    semi_minor = np.sqrt(median_area / (np.pi * median_aspect))
-    # Search radius: ellipse extends up to 2*semi_major from POI + margin
-    search_radius = int(np.sqrt((2 * semi_major) ** 2 + semi_minor**2) + 200)
-
-    print(f"    Verified courses analyzed: {len(areas)}")
-    print(f"    Median area: {median_area:,.0f} sq m ({median_area * 0.000247105:.0f} acres)")
-    print(f"    Median aspect ratio: {median_aspect:.2f}")
-    print(f"    Median POI-to-centroid offset: {median_offset:.0f} m")
-    print(f"    Search ellipse: {semi_major:.0f}m x {semi_minor:.0f}m (semi-axes)")
-    print(f"    Building search radius: {search_radius}m")
-
-    # === Phase 2: Fetch building center points ===
-    print("\n  Phase 2: Fetching building footprints from OpenStreetMap...")
-
-    # Collect all coordinates we need buildings around
-    all_query_coords = []
-
-    # FSQ-only coordinates
-    fsq_only_data = fsq_validation[fsq_only_mask]
-    for _, row in fsq_only_data.iterrows():
-        lat = row.get("foursquare_latitude")
-        lon = row.get("foursquare_longitude")
-        if pd.notna(lat) and pd.notna(lon):
-            all_query_coords.append((lat, lon))
-
-    # Sample verified course coordinates (for reference scoring)
-    verified_query_coords = []
-    for _, v_row in verified.iterrows():
-        fsq_id = v_row["foursquare_fsq_place_id"]
-        match = fsq_coords[fsq_coords["fsq_place_id"] == fsq_id]
-        if not match.empty:
-            lat, lon = match.iloc[0]["latitude"], match.iloc[0]["longitude"]
-            verified_query_coords.append((lat, lon))
-    # Use a sample of verified for building queries (limit Overpass load)
-    np.random.seed(42)
-    if len(verified_query_coords) > 80:
-        sample_idx = np.random.choice(
-            len(verified_query_coords), 80, replace=False
-        )
-        verified_sample_coords = [verified_query_coords[i] for i in sample_idx]
-    else:
-        verified_sample_coords = verified_query_coords
-    all_query_coords.extend(verified_sample_coords)
-
-    # Random negative examples (urban points far from golf courses)
-    bounds = osm_gdf.total_bounds
-    neg_coords = []
-    neg_attempts = 0
-    while len(neg_coords) < 50 and neg_attempts < 500:
-        rlon = np.random.uniform(bounds[0], bounds[2])
-        rlat = np.random.uniform(bounds[1], bounds[3])
-        rpt = gpd.GeoSeries(
-            [Point(rlon, rlat)], crs="EPSG:4326"
-        ).to_crs(UTM_CRS)[0]
-        if osm_proj.geometry.distance(rpt).min() > 2000:
-            neg_coords.append((rlat, rlon))
-            all_query_coords.append((rlat, rlon))
-        neg_attempts += 1
-
-    # Deduplicate coordinates (within ~10m of each other)
-    unique_coords = []
-    seen = set()
-    for lat, lon in all_query_coords:
-        key = (round(lat, 4), round(lon, 4))
-        if key not in seen:
-            seen.add(key)
-            unique_coords.append((lat, lon))
-
-    print(f"    Querying buildings around {len(unique_coords)} unique locations...")
-    building_dict = _fetch_buildings_around_points(unique_coords, search_radius)
-    print(f"    Total unique building points: {len(building_dict)}")
-
-    if not building_dict:
-        print("  No building data fetched. Using default scores.")
-        fsq_validation.loc[fsq_only_mask, "golf_probability_v2"] = 0.5
-        return fsq_validation
-
-    # Build spatial index on building center points
-    bldg_latlons = list(building_dict.values())
-    bldg_points_geom = [Point(lon, lat) for lat, lon in bldg_latlons]
-    bldg_gdf = gpd.GeoDataFrame(
-        geometry=bldg_points_geom, crs="EPSG:4326"
-    ).to_crs(UTM_CRS)
-    bldg_sindex = bldg_gdf.sindex
-
-    # === Phase 3: Directional ellipse scoring ===
-    print("\n  Phase 3: Directional ellipse scoring...")
-
-    N_DIRECTIONS = 16
-    angles = [2 * np.pi * i / N_DIRECTIONS for i in range(N_DIRECTIONS)]
-
-    def score_point(lat, lon):
-        """Find most building-free ellipse direction from a POI.
-
-        Returns (min_buildings_in_best_ellipse, surrounding_density).
-        """
-        try:
-            poi_proj = gpd.GeoSeries(
-                [Point(lon, lat)], crs="EPSG:4326"
-            ).to_crs(UTM_CRS)[0]
-        except Exception:
-            return 999, 1.0
-
-        best_count = float("inf")
-
-        for angle in angles:
-            # Ellipse center: POI + offset in direction `angle`
-            # The POI sits at the edge of the ellipse
-            cx = poi_proj.x + semi_major * np.cos(angle)
-            cy = poi_proj.y + semi_major * np.sin(angle)
-
-            # Conservative bounding box for spatial index query
-            bbox = (
-                cx - semi_major,
-                cy - semi_major,
-                cx + semi_major,
-                cy + semi_major,
-            )
-            candidates_idx = list(bldg_sindex.intersection(bbox))
-
-            count = 0
-            for bidx in candidates_idx:
-                bpt = bldg_gdf.geometry.iloc[bidx]
-                # Translate relative to ellipse center
-                dx = bpt.x - cx
-                dy = bpt.y - cy
-                # Rotate by -angle to align with ellipse axes
-                cos_a = np.cos(-angle)
-                sin_a = np.sin(-angle)
-                rx = dx * cos_a - dy * sin_a
-                ry = dx * sin_a + dy * cos_a
-                # Ellipse equation
-                if (rx / semi_major) ** 2 + (ry / semi_minor) ** 2 <= 1:
-                    count += 1
-
-            best_count = min(best_count, count)
-
-        # Surrounding building density (per sq km)
-        sr_bounds = (
-            poi_proj.x - search_radius,
-            poi_proj.y - search_radius,
-            poi_proj.x + search_radius,
-            poi_proj.y + search_radius,
-        )
-        total_nearby = len(list(bldg_sindex.intersection(sr_bounds)))
-        density = total_nearby / (np.pi * search_radius**2) * 1e6
-
-        return best_count, density
-
-    # Score verified courses (positive examples)
-    print("    Scoring verified sample (positive examples)...")
-    pos_scores = []
-    for lat, lon in verified_sample_coords:
-        mb, dens = score_point(lat, lon)
-        pos_scores.append([mb, dens])
-    print(f"      {len(pos_scores)} verified courses scored")
-    pos_arr = np.array(pos_scores)
-    print(
-        f"      Min buildings in best ellipse: "
-        f"median={np.median(pos_arr[:, 0]):.0f}, "
-        f"mean={np.mean(pos_arr[:, 0]):.0f}, "
-        f"p75={np.percentile(pos_arr[:, 0], 75):.0f}"
-    )
-
-    # Score negative examples
-    print("    Scoring negative examples...")
-    neg_scores = []
-    for lat, lon in neg_coords:
-        mb, dens = score_point(lat, lon)
-        neg_scores.append([mb, dens])
-    print(f"      {len(neg_scores)} negative examples scored")
-    if neg_scores:
-        neg_arr = np.array(neg_scores)
-        print(
-            f"      Min buildings in best ellipse: "
-            f"median={np.median(neg_arr[:, 0]):.0f}, "
-            f"mean={np.mean(neg_arr[:, 0]):.0f}"
-        )
-
-    if len(pos_scores) < 10 or len(neg_scores) < 10:
-        print("  Insufficient training data. Using heuristic scores.")
-        fsq_validation.loc[fsq_only_mask, "golf_probability_v2"] = 0.5
-        return fsq_validation
-
-    # === Phase 4: Train model ===
-    print("\n  Phase 4: Training model...")
-    X = np.array(pos_scores + neg_scores)
-    y = np.array([1] * len(pos_scores) + [0] * len(neg_scores))
-
-    model = GradientBoostingClassifier(
-        n_estimators=100, max_depth=3, random_state=42
-    )
-    model.fit(X, y)
-    print(f"    Training accuracy: {model.score(X, y):.1%}")
-    print(
-        f"    Feature importances: min_buildings={model.feature_importances_[0]:.2f}, "
-        f"density={model.feature_importances_[1]:.2f}"
-    )
-
-    # Score FSQ-only POIs
-    print(f"\n  Scoring {n_fsq_only} Foursquare-only POIs...")
-    fsq_only_indices = fsq_validation.index[fsq_only_mask]
-    probs_v2 = []
-    for i, idx in enumerate(fsq_only_indices):
-        row = fsq_validation.loc[idx]
-        lat = row.get("foursquare_latitude")
-        lon = row.get("foursquare_longitude")
-        if pd.notna(lat) and pd.notna(lon):
-            mb, dens = score_point(lat, lon)
-            prob = model.predict_proba(np.array([[mb, dens]]))[0][1]
-        else:
-            prob = 0.0
-        probs_v2.append(prob)
-        if (i + 1) % 100 == 0:
-            print(f"    Scored {i + 1}/{n_fsq_only}...")
-
-    fsq_validation.loc[fsq_only_indices, "golf_probability_v2"] = probs_v2
-
-    likely_v2 = sum(1 for p in probs_v2 if p >= 0.5)
-    print(f"\n  V2 Results: {likely_v2} likely golf courses, {n_fsq_only - likely_v2} unlikely")
-
-    # Save v2 report (separate file)
-    report_path = os.path.join(DATA_DIR, "foursquare_validation_report_v2.csv")
-    fsq_validation.to_csv(report_path, index=False)
-    print(f"  Saved to {report_path}")
-
-    # === Print v1 vs v2 comparison for key examples ===
-    print("\n  V1 vs V2 comparison (Foursquare-only POIs):")
-    print(f"  {'Name':<40} {'V1':>6} {'V2':>6} {'Change':>8}")
-    print("  " + "-" * 62)
-    for _, row in fsq_validation[fsq_only_mask].iterrows():
-        name = row.get("foursquare_name", "")
-        v1 = row.get("golf_probability", np.nan)
-        v2 = row.get("golf_probability_v2", np.nan)
-        if pd.notna(v1) and pd.notna(v2):
-            diff = v2 - v1
-            # Show key examples and interesting changes
-            if any(kw in name for kw in [
-                "Avalon", "Union League", "Sand Barrens",
-                "Cape May Par", "Pinelands",
-            ]) or abs(diff) > 0.3:
-                print(f"  {name:<40} {v1:>5.0%} {v2:>5.0%} {diff:>+7.0%}")
-
-    return fsq_validation
-
-
-def validate_with_web(osm_gdf):
-    """Validate golf courses using web search/scraping."""
-    print("[4/7] Validating golf courses with web sources...")
-
-    results = []
-    osm_projected = osm_gdf.to_crs(UTM_CRS)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-
-    for idx, row in osm_gdf.iterrows():
-        name = row.get("name", "Unknown Golf Course")
-        osm_geom = osm_projected.geometry.iloc[osm_gdf.index.get_loc(idx)]
-        area_sqm = osm_geom.area
-        area_acres = area_sqm * 0.000247105
-
-        result = {
-            "name": name,
-            "osm_area_sqm": round(area_sqm, 2),
-            "osm_area_acres": round(area_acres, 2),
-            "web_area_acres": None,
-            "area_diff_pct": None,
-            "status": "unknown",
-            "course_type": "unknown",
-            "holes": "unknown",
-            "source_url": "",
-            "notes": "",
-        }
-
-        if name == "Unknown Golf Course":
-            results.append(result)
-            continue
-
-        # Try searching for the course info
-        try:
-            search_query = f"{name} New Jersey golf course"
-            search_url = f"https://www.google.com/search?q={requests.utils.quote(search_query)}"
-            resp = requests.get(search_url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                text = soup.get_text().lower()
-
-                # Try to determine course type
-                if "public" in text and "course" in text:
-                    result["course_type"] = "public"
-                elif "private" in text and ("member" in text or "club" in text):
-                    result["course_type"] = "private"
-                elif "semi-private" in text or "semi private" in text:
-                    result["course_type"] = "semi-private"
-
-                # Try to determine holes
-                if "18-hole" in text or "18 hole" in text:
-                    result["holes"] = "18"
-                elif "27-hole" in text or "27 hole" in text:
-                    result["holes"] = "27"
-                elif "36-hole" in text or "36 hole" in text:
-                    result["holes"] = "36"
-                elif "9-hole" in text or "9 hole" in text:
-                    result["holes"] = "9"
-
-                # Try to determine status
-                if "permanently closed" in text or "closed permanently" in text:
-                    result["status"] = "permanently closed"
-                elif "temporarily closed" in text:
-                    result["status"] = "temporarily closed"
-                elif "open" in text and ("tee time" in text or "book" in text):
-                    result["status"] = "open"
-                else:
-                    result["status"] = "likely open"
-
-                # Try to find acreage
-                acre_patterns = [
-                    r"(\d+[\.,]?\d*)\s*(?:acre|acres)",
-                    r"(\d+[\.,]?\d*)\s*-\s*acre",
-                ]
-                for pattern in acre_patterns:
-                    match = re.search(pattern, text)
-                    if match:
-                        try:
-                            web_acres = float(
-                                match.group(1).replace(",", "")
-                            )
-                            if 10 < web_acres < 1000:  # Sanity check
-                                result["web_area_acres"] = web_acres
-                                diff = abs(area_acres - web_acres) / web_acres * 100
-                                result["area_diff_pct"] = round(diff, 1)
-                                break
-                        except ValueError:
-                            pass
-
-                result["source_url"] = search_url
-        except Exception as e:
-            result["notes"] = f"Web search failed: {e}"
-
-        results.append(result)
-
-        # Rate limit
-        time.sleep(1.0)
-
-        # Print progress every 10 courses
-        if (len(results)) % 10 == 0:
-            print(f"  Processed {len(results)}/{len(osm_gdf)} courses...")
-
-    web_df = pd.DataFrame(results)
-
-    # Generate markdown report
-    report_lines = ["# NJ Golf Courses - Web Validation Report\n"]
-    report_lines.append(f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}\n")
-    report_lines.append(f"Total courses analyzed: {len(web_df)}\n")
-
-    # Summary statistics
-    validated = web_df[web_df["web_area_acres"].notna()]
-    with_type = web_df[web_df["course_type"] != "unknown"]
-    with_status = web_df[web_df["status"] != "unknown"]
-    discrepancies = web_df[
-        (web_df["area_diff_pct"].notna()) & (web_df["area_diff_pct"] > 20)
-    ]
-
-    report_lines.append("## Summary Statistics\n")
-    report_lines.append(f"- Courses with web-reported acreage: {len(validated)}")
-    report_lines.append(f"- Courses with identified type: {len(with_type)}")
-    report_lines.append(f"- Courses with identified status: {len(with_status)}")
-    report_lines.append(
-        f"- Courses with significant area discrepancy (>20%): {len(discrepancies)}\n"
-    )
-
-    # Course type breakdown
-    report_lines.append("## Course Type Breakdown\n")
-    type_counts = web_df["course_type"].value_counts()
-    for ctype, count in type_counts.items():
-        report_lines.append(f"- {ctype}: {count}")
-    report_lines.append("")
-
-    # Area comparison table
-    report_lines.append("## Area Comparison: OSM vs Web-Reported\n")
-    report_lines.append(
-        "| Course Name | OSM Area (acres) | Web Area (acres) | Difference (%) | Notes |"
-    )
-    report_lines.append("|---|---|---|---|---|")
-    for _, row in web_df.iterrows():
-        web_acres = (
-            f"{row['web_area_acres']:.1f}" if pd.notna(row["web_area_acres"]) else "N/A"
-        )
-        diff = (
-            f"{row['area_diff_pct']:.1f}%" if pd.notna(row["area_diff_pct"]) else "N/A"
-        )
-        flag = " **DISCREPANCY**" if pd.notna(row["area_diff_pct"]) and row["area_diff_pct"] > 20 else ""
-        report_lines.append(
-            f"| {row['name']} | {row['osm_area_acres']:.1f} | {web_acres} | {diff}{flag} | {row['course_type']}, {row['holes']} holes, {row['status']} |"
-        )
-    report_lines.append("")
-
-    # Discrepancy details
-    if len(discrepancies) > 0:
-        report_lines.append("## Significant Area Discrepancies (>20%)\n")
-        for _, row in discrepancies.iterrows():
-            report_lines.append(f"### {row['name']}")
-            report_lines.append(f"- OSM area: {row['osm_area_acres']:.1f} acres")
-            report_lines.append(f"- Web-reported area: {row['web_area_acres']:.1f} acres")
-            report_lines.append(f"- Difference: {row['area_diff_pct']:.1f}%")
-            report_lines.append(
-                f"- Possible reasons: OSM boundary may include/exclude parking, clubhouse, driving range, or surrounding land"
-            )
-            report_lines.append("")
-
-    # Sources
-    report_lines.append("## Sources\n")
-    report_lines.append("- OpenStreetMap (OSM) polygon data via Overpass API")
-    report_lines.append("- Google Search results for individual course information")
-    report_lines.append(
-        "- Note: Web-scraped data may be incomplete or inaccurate. Manual verification recommended for critical use.\n"
-    )
-
-    report_path = os.path.join(DATA_DIR, "web_validation_report.md")
-    with open(report_path, "w") as f:
-        f.write("\n".join(report_lines))
-
-    print(f"  Validated {len(validated)} courses with web acreage data.")
-    print(f"  Found {len(discrepancies)} significant discrepancies.")
-    print(f"  Saved report to {report_path}")
-    return web_df
-
-
-def create_map(gdf, validation_df, web_df=None):
+def create_map(gdf, validation_df, config=None):
     """Create an interactive HTML map with folium and a left sidebar."""
-    print("[5/7] Creating interactive map...")
+    if config is None:
+        config = PipelineConfig()
+    print("[4/5] Creating interactive map...")
 
     # Center map on NJ
-    gdf_projected = gdf.to_crs(UTM_CRS)
+    gdf_projected = gdf.to_crs(config.utm_crs)
     gdf_centroids = gdf_projected.geometry.centroid.to_crs("EPSG:4326")
     center_lat = gdf_centroids.y.mean()
     center_lon = gdf_centroids.x.mean()
@@ -1305,12 +573,6 @@ def create_map(gdf, validation_df, web_df=None):
             validation_df[validation_df["foursquare_match"] == True]["osm_id"].values
         )
 
-    # Build web info lookup
-    web_info = {}
-    if web_df is not None and not web_df.empty:
-        for _, row in web_df.iterrows():
-            web_info[row["name"]] = row
-
     # Create FeatureGroups for toggleable overlay categories
     verified_group = folium.FeatureGroup(name="Verified (OSM + Foursquare)", show=True)
     osm_only_group = folium.FeatureGroup(name="OSM Only", show=True)
@@ -1337,14 +599,6 @@ def create_map(gdf, validation_df, web_df=None):
         popup_html += f"Area: {area_sqm:,.0f} sq m ({area_acres:,.1f} acres)<br>"
         popup_html += f"OSM ID: {osm_id}<br>"
         popup_html += f"Foursquare: {'Verified' if is_verified else 'Not matched'}<br>"
-
-        if name in web_info:
-            wi = web_info[name]
-            popup_html += f"Type: {wi.get('course_type', 'unknown')}<br>"
-            popup_html += f"Holes: {wi.get('holes', 'unknown')}<br>"
-            popup_html += f"Status: {wi.get('status', 'unknown')}<br>"
-            if pd.notna(wi.get("web_area_acres")):
-                popup_html += f"Web Area: {wi['web_area_acres']:.1f} acres<br>"
 
         geojson_data = row.geometry.__geo_interface__
         layer = folium.GeoJson(
@@ -1448,7 +702,7 @@ def create_map(gdf, validation_df, web_df=None):
         '</style>\n'
         '<div id="sidebar">\n'
         '  <div id="sidebar-header">\n'
-        '    <h3>NJ Golf Courses</h3>\n'
+        '    <h3>' + config.display_name + '</h3>\n'
         '    <label class="toggle-row">\n'
         '      <input type="checkbox" id="tog-verified" checked onchange="toggleCategory(\'verified\',this.checked)">\n'
         '      <span class="color-swatch" style="background:#2563eb;opacity:0.6;"></span>\n'
@@ -1464,7 +718,7 @@ def create_map(gdf, validation_df, web_df=None):
         '      <span class="color-swatch circle" style="background:#dc2626;opacity:0.6;"></span>\n'
         '      Foursquare Only\n'
         '    </label>\n'
-        '    <input type="text" id="search-box" placeholder="Search golf course name..." oninput="filterFacilities()">\n'
+        '    <input type="text" id="search-box" placeholder="Search ' + config.keyword.lower() + ' name..." oninput="filterFacilities()">\n'
         '  </div>\n'
         '  <div class="facility-count" id="facility-count"></div>\n'
         '  <div id="facility-list"></div>\n'
@@ -1549,23 +803,118 @@ def create_map(gdf, validation_df, web_df=None):
     sidebar._template = Template(sidebar_tpl)
     m.get_root().add_child(sidebar)
 
-    map_path = os.path.join(DATA_DIR, "nj_golf_courses_map.html")
+    map_path = os.path.join(DATA_DIR, config.file_path("map.html"))
     m.save(map_path)
     print(f"  Map saved to {map_path}")
     return m
 
 
-def create_editable_map(gdf, validation_df):
-    """Create an editable HTML map for reviewing/exporting golf course polygons.
+def create_editable_map(gdf, validation_df, config=None, fsq_df=None):
+    """Create an editable HTML map for reviewing/exporting POI polygons.
 
-    Users can check/uncheck courses, edit polygon vertices via Leaflet-Geoman,
+    Users can check/uncheck entries, edit polygon vertices via Leaflet-Geoman,
     expand Foursquare-only hexagons into full polygons, and export checked
     polygons as a GeoJSON download.
     """
-    print("[Editable Map] Creating editable golf course map...")
+    if config is None:
+        config = PipelineConfig()
+    print(f"[Editable Map] Creating editable {config.keyword.lower()} map...")
+
+    # --- Read user guide markdown and convert to simple HTML ---
+    guide_html = ""
+    guide_md_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "EDITABLE_MAP_USER_GUIDE.md"
+    )
+    if os.path.exists(guide_md_path):
+        with open(guide_md_path, "r") as gf:
+            md_text = gf.read()
+        html_lines = []
+        in_table = False
+        in_list = False
+        for line in md_text.split("\n"):
+            stripped = line.strip()
+            if stripped == "---":
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                if in_table:
+                    html_lines.append("</table>")
+                    in_table = False
+                html_lines.append("<hr>")
+                continue
+            if stripped.startswith("|") and stripped.endswith("|"):
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                cells = [c.strip() for c in stripped.strip("|").split("|")]
+                if all(set(c) <= {"-", " ", ":"} for c in cells):
+                    continue
+                if not in_table:
+                    html_lines.append('<table style="width:100%;border-collapse:collapse;margin:10px 0;">')
+                    in_table = True
+                    html_lines.append("<tr>" + "".join(
+                        '<th style="text-align:left;border-bottom:2px solid #ccc;padding:6px 8px;">' + c + '</th>'
+                        for c in cells
+                    ) + "</tr>")
+                else:
+                    html_lines.append("<tr>" + "".join(
+                        '<td style="border-bottom:1px solid #eee;padding:6px 8px;">' + c + '</td>'
+                        for c in cells
+                    ) + "</tr>")
+                continue
+            if in_table and not stripped.startswith("|"):
+                html_lines.append("</table>")
+                in_table = False
+            if stripped.startswith("### "):
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                html_lines.append("<h4>" + stripped[4:] + "</h4>")
+                continue
+            if stripped.startswith("## "):
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                html_lines.append("<h3>" + stripped[3:] + "</h3>")
+                continue
+            if stripped.startswith("# "):
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                html_lines.append("<h2>" + stripped[2:] + "</h2>")
+                continue
+            if stripped.startswith("- ") or stripped.startswith("* "):
+                if not in_list:
+                    html_lines.append("<ul>")
+                    in_list = True
+                content = stripped[2:]
+                content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', content)
+                html_lines.append("<li>" + content + "</li>")
+                continue
+            if stripped and stripped[0].isdigit() and ". " in stripped:
+                if not in_list:
+                    html_lines.append("<ul>")
+                    in_list = True
+                content = stripped.split(". ", 1)[1]
+                content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', content)
+                html_lines.append("<li>" + content + "</li>")
+                continue
+            if in_list and not stripped:
+                html_lines.append("</ul>")
+                in_list = False
+            if stripped:
+                text = stripped
+                text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+                text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+                html_lines.append("<p>" + text + "</p>")
+        if in_list:
+            html_lines.append("</ul>")
+        if in_table:
+            html_lines.append("</table>")
+        guide_html = "\n".join(html_lines)
 
     # --- 1. Base map setup ---
-    gdf_projected = gdf.to_crs(UTM_CRS)
+    gdf_projected = gdf.to_crs(config.utm_crs)
     gdf_centroids = gdf_projected.geometry.centroid.to_crs("EPSG:4326")
     center_lat = gdf_centroids.y.mean()
     center_lon = gdf_centroids.x.mean()
@@ -1615,8 +964,12 @@ def create_editable_map(gdf, validation_df):
 
         geojson_geom = row.geometry.__geo_interface__
 
-        # Look up fsq_id for verified courses
+        # Look up fsq_id + POI coordinates + address for verified courses
         fsq_id = ""
+        fsq_name = ""
+        fsq_address = ""
+        poi_lat = None
+        poi_lon = None
         if is_verified and not validation_df.empty:
             match = validation_df[
                 (validation_df["osm_id"] == osm_id)
@@ -1624,6 +977,16 @@ def create_editable_map(gdf, validation_df):
             ]
             if not match.empty:
                 fsq_id = str(match.iloc[0].get("foursquare_fsq_place_id", ""))
+                fsq_name = str(match.iloc[0].get("foursquare_name", ""))
+                if fsq_df is not None and not fsq_df.empty and fsq_id:
+                    fsq_match = fsq_df[fsq_df["fsq_place_id"] == fsq_id]
+                    if not fsq_match.empty:
+                        poi_lat = float(fsq_match.iloc[0]["latitude"])
+                        poi_lon = float(fsq_match.iloc[0]["longitude"])
+                        addr = fsq_match.iloc[0].get("address", "")
+                        loc = fsq_match.iloc[0].get("locality", "")
+                        parts = [str(p) for p in [addr, loc] if pd.notna(p) and str(p).strip()]
+                        fsq_address = ", ".join(parts)
 
         # Preserve OSM node IDs (parallel to coordinate rings)
         node_ids = row.get("_node_ids", None)
@@ -1641,6 +1004,10 @@ def create_editable_map(gdf, validation_df):
             "geometry": geojson_geom,
             "osm_id": osm_id,
             "fsq_id": fsq_id,
+            "fsq_name": fsq_name,
+            "fsq_address": fsq_address,
+            "poi_lat": poi_lat,
+            "poi_lon": poi_lon,
             "_node_ids": node_ids,
         })
         fid += 1
@@ -1655,6 +1022,15 @@ def create_editable_map(gdf, validation_df):
                 continue
             fsq_name = row.get("foursquare_name", "Unknown")
             fsq_place_id = str(row.get("foursquare_fsq_place_id", ""))
+            # Look up address from fsq_df
+            fsq_addr = ""
+            if fsq_df is not None and not fsq_df.empty and fsq_place_id:
+                fsq_match = fsq_df[fsq_df["fsq_place_id"] == fsq_place_id]
+                if not fsq_match.empty:
+                    addr = fsq_match.iloc[0].get("address", "")
+                    loc = fsq_match.iloc[0].get("locality", "")
+                    parts = [str(p) for p in [addr, loc] if pd.notna(p) and str(p).strip()]
+                    fsq_addr = ", ".join(parts)
             hex_geom = _make_hexagon(float(lat), float(lon), radius_m=75)
             facilities.append({
                 "id": fid,
@@ -1664,6 +1040,10 @@ def create_editable_map(gdf, validation_df):
                 "geometry": hex_geom,
                 "osm_id": "",
                 "fsq_id": fsq_place_id,
+                "fsq_name": fsq_name,
+                "fsq_address": fsq_addr,
+                "poi_lat": float(lat),
+                "poi_lon": float(lon),
             })
             fid += 1
 
@@ -1673,6 +1053,14 @@ def create_editable_map(gdf, validation_df):
     n_osm = sum(1 for f in facilities if f["category"] == "osm_only")
     n_fsq = sum(1 for f in facilities if f["category"] == "fsq_only")
     print(f"  Facilities: {n_verified} verified, {n_osm} OSM-only, {n_fsq} FSQ-only")
+
+    # Compute bounds for the "Add Course" coordinate check
+    _bounds = gdf.total_bounds  # minx, miny, maxx, maxy
+    _margin = 0.5
+    bounds_min_lat = round(_bounds[1] - _margin, 1)
+    bounds_max_lat = round(_bounds[3] + _margin, 1)
+    bounds_min_lon = round(_bounds[0] - _margin, 1)
+    bounds_max_lon = round(_bounds[2] + _margin, 1)
 
     # --- 3-6. Full HTML page with Leaflet-Geoman, sidebar, export ---
     # Visibility: all categories visible on map by default (category toggles
@@ -1684,8 +1072,9 @@ def create_editable_map(gdf, validation_df):
     #   "Done Editing" button to finish.
     editable_tpl = (
         '{% macro html(this, kwargs) %}\n'
-        '<link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />\n'
-        '<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>\n'
+        '<link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.17.0/dist/leaflet-geoman.css" />\n'
+        '<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.17.0/dist/leaflet-geoman.min.js"></script>\n'
+        '<script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>\n'
         '<style>\n'
         '#ed-sidebar {\n'
         '  position: fixed; top: 0; left: 0; width: 340px; height: 100vh;\n'
@@ -1705,7 +1094,19 @@ def create_editable_map(gdf, validation_df):
         '  display: flex; align-items: center; padding: 3px 0; cursor: pointer;\n'
         '  font-weight: 600; font-size: 12px; color: #555;\n'
         '}\n'
-        '.ed-cat-header input[type=checkbox] { margin-right: 8px; cursor: pointer; }\n'
+        '.ed-cat-header input[type=checkbox] { display: none; }\n'
+        '.ed-toggle {\n'
+        '  position: relative; width: 32px; height: 18px; background: #ccc;\n'
+        '  border-radius: 9px; margin-right: 8px; flex-shrink: 0;\n'
+        '  transition: background 0.2s; cursor: pointer;\n'
+        '}\n'
+        '.ed-toggle::after {\n'
+        '  content: ""; position: absolute; top: 2px; left: 2px;\n'
+        '  width: 14px; height: 14px; background: #fff; border-radius: 50%;\n'
+        '  transition: transform 0.2s;\n'
+        '}\n'
+        '.ed-cat-header input:checked + .ed-toggle { background: #4f46e5; }\n'
+        '.ed-cat-header input:checked + .ed-toggle::after { transform: translateX(14px); }\n'
         '.ed-swatch {\n'
         '  display: inline-block; width: 12px; height: 12px; margin-right: 6px;\n'
         '  border-radius: 2px; vertical-align: middle;\n'
@@ -1769,6 +1170,63 @@ def create_editable_map(gdf, validation_df):
         '}\n'
         '#ed-ctx-menu div:hover { background: #f0f7ff; }\n'
         '#ed-ctx-menu div.ed-ctx-danger:hover { background: #fef2f2; color: #dc2626; }\n'
+        '#ed-add-course-btn {\n'
+        '  margin: 10px 14px 0; padding: 10px; background: #7c3aed; color: #fff;\n'
+        '  border: none; border-radius: 4px; cursor: pointer; font-size: 13px;\n'
+        '  font-weight: 600; flex-shrink: 0;\n'
+        '}\n'
+        '#ed-add-course-btn:hover { background: #6d28d9; }\n'
+        '#ed-csv-btn {\n'
+        '  margin: 6px 14px 0; padding: 10px; background: #16a34a; color: #fff;\n'
+        '  border: none; border-radius: 4px; cursor: pointer; font-size: 13px;\n'
+        '  font-weight: 600; flex-shrink: 0;\n'
+        '}\n'
+        '#ed-csv-btn:hover { background: #15803d; }\n'
+        '.ed-modal-overlay {\n'
+        '  display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;\n'
+        '  background: rgba(0,0,0,0.5); z-index: 3000; justify-content: center; align-items: center;\n'
+        '}\n'
+        '.ed-modal-overlay.ed-show { display: flex; }\n'
+        '.ed-modal {\n'
+        '  background: #fff; border-radius: 8px; padding: 24px; min-width: 360px;\n'
+        '  max-width: 500px; box-shadow: 0 8px 30px rgba(0,0,0,0.3);\n'
+        '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;\n'
+        '  font-size: 13px;\n'
+        '}\n'
+        '.ed-modal h3 { margin: 0 0 16px; font-size: 16px; color: #333; }\n'
+        '.ed-modal label { display: block; margin-bottom: 4px; font-weight: 600; color: #555; font-size: 12px; }\n'
+        '.ed-modal input[type=text], .ed-modal input[type=number] {\n'
+        '  width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;\n'
+        '  font-size: 13px; box-sizing: border-box; margin-bottom: 12px;\n'
+        '}\n'
+        '.ed-modal input:focus { outline: none; border-color: #7c3aed; box-shadow: 0 0 0 2px rgba(124,58,237,0.15); }\n'
+        '.ed-modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }\n'
+        '.ed-modal-btns button {\n'
+        '  padding: 8px 18px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600;\n'
+        '}\n'
+        '.ed-modal-btns .ed-btn-primary { background: #7c3aed; color: #fff; border: none; }\n'
+        '.ed-modal-btns .ed-btn-primary:hover { background: #6d28d9; }\n'
+        '.ed-modal-btns .ed-btn-cancel { background: #fff; color: #555; border: 1px solid #ccc; }\n'
+        '.ed-modal-btns .ed-btn-cancel:hover { background: #f5f5f5; }\n'
+        '.ed-modal-warn { color: #d97706; font-size: 12px; margin: -8px 0 8px; }\n'
+        '#ed-help-btn {\n'
+        '  width: 24px; height: 24px; border-radius: 50%; background: #e0e7ff; color: #4338ca;\n'
+        '  border: 1px solid #a5b4fc; font-weight: 700; font-size: 14px; cursor: pointer;\n'
+        '  display: inline-flex; align-items: center; justify-content: center;\n'
+        '  margin-left: 8px; vertical-align: middle; flex-shrink: 0;\n'
+        '}\n'
+        '#ed-help-btn:hover { background: #c7d2fe; }\n'
+        '#ed-help-modal .ed-modal {\n'
+        '  max-width: 640px; max-height: 80vh; overflow-y: auto;\n'
+        '}\n'
+        '#ed-help-modal .ed-modal h2 { font-size: 18px; margin: 16px 0 8px; color: #333; }\n'
+        '#ed-help-modal .ed-modal h3 { font-size: 15px; margin: 14px 0 6px; color: #444; }\n'
+        '#ed-help-modal .ed-modal h4 { font-size: 13px; margin: 12px 0 4px; color: #555; }\n'
+        '#ed-help-modal .ed-modal p { margin: 6px 0; line-height: 1.5; color: #444; }\n'
+        '#ed-help-modal .ed-modal ul { margin: 6px 0; padding-left: 20px; }\n'
+        '#ed-help-modal .ed-modal li { margin: 3px 0; line-height: 1.5; color: #444; }\n'
+        '#ed-help-modal .ed-modal hr { border: none; border-top: 1px solid #e0e0e0; margin: 16px 0; }\n'
+        '#ed-help-modal .ed-modal code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; font-size: 12px; }\n'
         '</style>\n'
         '<div id="ed-ctx-menu">\n'
         '  <div onclick="edCtxEdit()">Edit Shape</div>\n'
@@ -1780,13 +1238,44 @@ def create_editable_map(gdf, validation_df):
         '  <span style="color:#92400e;font-size:11px;">(drag vertices to reshape &mdash; right-click or Esc to finish)</span>\n'
         '  <button class="ed-done-btn" onclick="edStopEditing()">Done</button>\n'
         '</div>\n'
+        '<!-- Add Course modal -->\n'
+        '<div id="ed-add-modal" class="ed-modal-overlay">\n'
+        '  <div class="ed-modal">\n'
+        '    <h3>Add New ' + config.keyword + '</h3>\n'
+        '    <label for="ed-add-name">Name (required)</label>\n'
+        '    <input type="text" id="ed-add-name" placeholder="e.g. Pine Valley Golf Club" oninput="edAddCheckDup()">\n'
+        '    <div id="ed-add-dup-warn" class="ed-modal-warn" style="display:none;"></div>\n'
+        '    <label for="ed-add-lat">Latitude (required)</label>\n'
+        '    <input type="number" id="ed-add-lat" step="any" placeholder="e.g. 40.123">\n'
+        '    <label for="ed-add-lon">Longitude (required)</label>\n'
+        '    <input type="number" id="ed-add-lon" step="any" placeholder="e.g. -74.567">\n'
+        '    <div class="ed-modal-btns">\n'
+        '      <button class="ed-btn-cancel" onclick="edAddClose()">Cancel</button>\n'
+        '      <button class="ed-btn-primary" onclick="edAddSubmit()">Add Course</button>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '</div>\n'
+        '<!-- Help modal -->\n'
+        '<div id="ed-help-modal" class="ed-modal-overlay">\n'
+        '  <div class="ed-modal">\n'
+        '    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">\n'
+        '      <h3 style="margin:0;">User Guide</h3>\n'
+        '      <button class="ed-btn-cancel" onclick="edHelpClose()" style="padding:4px 12px;">Close</button>\n'
+        '    </div>\n'
+        '    <div id="ed-help-content">GUIDE_HTML_PLACEHOLDER</div>\n'
+        '  </div>\n'
+        '</div>\n'
         '<div id="ed-sidebar">\n'
         '  <div id="ed-sidebar-header">\n'
-        '    <h3>Editable Golf Courses</h3>\n'
-        '    <div class="ed-hint">Checkbox = include in export. Right-click polygon to edit or delete.</div>\n'
+        '    <div style="display:flex;align-items:center;">\n'
+        '      <h3 style="flex:1;">Editable ' + config.display_name + '</h3>\n'
+        '      <button id="ed-help-btn" onclick="edHelpOpen()" title="Help / Instructions">?</button>\n'
+        '    </div>\n'
+        '    <div class="ed-hint">Toggle = show/hide on map. Checkbox = include in export. Right-click polygon to edit or delete.</div>\n'
         '    <div class="ed-cat-section">\n'
         '      <label class="ed-cat-header">\n'
         '        <input type="checkbox" id="vis-verified" checked onchange="edToggleVis(\'verified\',this.checked)">\n'
+        '        <span class="ed-toggle"></span>\n'
         '        <span class="ed-swatch" style="background:#2563eb;opacity:0.7;"></span>\n'
         '        Verified (OSM + Foursquare)\n'
         '      </label>\n'
@@ -1794,6 +1283,7 @@ def create_editable_map(gdf, validation_df):
         '    <div class="ed-cat-section">\n'
         '      <label class="ed-cat-header">\n'
         '        <input type="checkbox" id="vis-osm_only" checked onchange="edToggleVis(\'osm_only\',this.checked)">\n'
+        '        <span class="ed-toggle"></span>\n'
         '        <span class="ed-swatch" style="background:#dc2626;opacity:0.7;"></span>\n'
         '        OSM Only\n'
         '      </label>\n'
@@ -1801,19 +1291,34 @@ def create_editable_map(gdf, validation_df):
         '    <div class="ed-cat-section">\n'
         '      <label class="ed-cat-header">\n'
         '        <input type="checkbox" id="vis-fsq_only" checked onchange="edToggleVis(\'fsq_only\',this.checked)">\n'
+        '        <span class="ed-toggle"></span>\n'
         '        <span class="ed-swatch" style="background:#dc2626;opacity:0.7;"></span>\n'
         '        Foursquare Only\n'
         '      </label>\n'
         '    </div>\n'
-        '    <input type="text" id="ed-search" placeholder="Search golf course name..." oninput="edRenderList()">\n'
+        '    <input type="text" id="ed-search" placeholder="Search ' + config.keyword.lower() + ' name..." oninput="edRenderList()">\n'
         '    <label style="display:flex;align-items:center;margin-top:6px;cursor:pointer;user-select:none;">\n'
         '      <input type="checkbox" id="ed-hover-toggle" checked onchange="edSetHoverPan(this.checked)" style="margin-right:6px;cursor:pointer;">\n'
         '      <span style="font-size:12px;color:#555;">Hover to pan (uncheck to require click)</span>\n'
         '    </label>\n'
+        '    <div id="ed-buffer-section" style="display:flex;align-items:center;margin-top:6px;gap:8px;">\n'
+        '      <label style="display:flex;align-items:center;cursor:pointer;user-select:none;">\n'
+        '        <input type="checkbox" id="ed-buffer-toggle" onchange="edToggleBuffers(this.checked)" style="margin-right:6px;cursor:pointer;">\n'
+        '        <span style="font-size:12px;color:#555;">Show Buffers</span>\n'
+        '      </label>\n'
+        '      <label style="display:flex;align-items:center;font-size:12px;color:#555;">\n'
+        '        <input type="number" id="ed-buffer-radius" value="1" min="0.1" step="0.1"\n'
+        '          style="width:50px;padding:2px 4px;border:1px solid #ccc;border-radius:3px;font-size:12px;text-align:center;"\n'
+        '          onchange="edUpdateBufferRadius(+this.value)">\n'
+        '        <span style="margin-left:4px;">mi</span>\n'
+        '      </label>\n'
+        '    </div>\n'
         '  </div>\n'
         '  <div class="ed-count" id="ed-count"></div>\n'
         '  <div id="ed-facility-list"></div>\n'
+        '  <button id="ed-add-course-btn" onclick="edAddOpen()">+ Add Course</button>\n'
         '  <button id="ed-export-btn" onclick="edExport()">Export GeoJSON</button>\n'
+        '  <button id="ed-csv-btn" onclick="edExportCSV()">Export Checked to CSV</button>\n'
         '  <button id="ed-import-btn" onclick="document.getElementById(\'ed-import-file\').click()">Import GeoJSON</button>\n'
         '  <input type="file" id="ed-import-file" accept=".geojson,.json" style="display:none" onchange="edImport(this)">\n'
         '</div>\n'
@@ -1828,6 +1333,9 @@ def create_editable_map(gdf, validation_df):
         '  var deletedIds = {};   // id -> true for deleted facilities\n'
         '  var ctxTargetId = null;\n'
         '  var mapObj = null;\n'
+        '  var bufferLayers = {};     // id -> L.geoJSON buffer layer\n'
+        '  var bufferVisible = false;\n'
+        '  var bufferRadiusMiles = 1;\n'
         '\n'
         '  function getMap() {\n'
         '    if (mapObj) return mapObj;\n'
@@ -1848,6 +1356,38 @@ def create_editable_map(gdf, validation_df):
         '    return null;\n'
         '  }\n'
         '\n'
+        '  // --- Buffer computation ---\n'
+        '  function computeBufferGeom(geom) {\n'
+        '    try {\n'
+        '      var tf = turf.feature(geom);\n'
+        '      var buffered = turf.buffer(tf, bufferRadiusMiles, {units: "miles"});\n'
+        '      return buffered ? buffered.geometry : null;\n'
+        '    } catch(e) { return null; }\n'
+        '  }\n'
+        '  function updateBuffer(id) {\n'
+        '    var m = getMap(); if (!m) return;\n'
+        '    if (bufferLayers[id]) {\n'
+        '      if (m.hasLayer(bufferLayers[id])) m.removeLayer(bufferLayers[id]);\n'
+        '      delete bufferLayers[id];\n'
+        '    }\n'
+        '    var geom = null;\n'
+        '    var layer = layers[id];\n'
+        '    if (layer) { layer.eachLayer(function(sub) { if (sub.toGeoJSON) geom = sub.toGeoJSON().geometry; }); }\n'
+        '    if (!geom) { var f = facilityById(id); if (f) geom = f.geometry; }\n'
+        '    if (!geom) return;\n'
+        '    var bufGeom = computeBufferGeom(geom);\n'
+        '    if (!bufGeom) return;\n'
+        '    var bl = L.geoJSON({type:"Feature",geometry:bufGeom,properties:{}}, {\n'
+        '      style: {fillColor:"#f59e0b",color:"#d97706",weight:1.5,fillOpacity:0.1,dashArray:"6,4"},\n'
+        '      interactive: false\n'
+        '    });\n'
+        '    bufferLayers[id] = bl;\n'
+        '    if (bufferVisible && fState[id] && fState[id].checked && !deletedIds[id]) bl.addTo(m);\n'
+        '  }\n'
+        '  function updateAllBuffers() {\n'
+        '    for (var i = 0; i < facilities.length; i++) updateBuffer(facilities[i].id);\n'
+        '  }\n'
+        '\n'
         '  // --- Editing ---\n'
         '  function startEditing(id) {\n'
         '    if (editingId !== null) stopEditingInternal();\n'
@@ -1855,8 +1395,9 @@ def create_editable_map(gdf, validation_df):
         '    if (!layer) return;\n'
         '    editingId = id;\n'
         '    layer.eachLayer(function(sub) {\n'
-        '      if (sub.pm) sub.pm.enable({allowSelfIntersection: false});\n'
+        '      sub.unbindTooltip();\n'
         '      sub.setStyle({weight: 3, dashArray: "6,4"});\n'
+        '      if (sub.pm) sub.pm.enable({allowSelfIntersection: false});\n'
         '    });\n'
         '    var f = facilityById(id);\n'
         '    var bar = document.getElementById("ed-edit-bar");\n'
@@ -1865,6 +1406,7 @@ def create_editable_map(gdf, validation_df):
         '  }\n'
         '  function stopEditingInternal() {\n'
         '    if (editingId === null) return;\n'
+        '    var prevId = editingId;\n'
         '    var layer = layers[editingId];\n'
         '    var f = facilityById(editingId);\n'
         '    if (layer) {\n'
@@ -1872,10 +1414,12 @@ def create_editable_map(gdf, validation_df):
         '      layer.eachLayer(function(sub) {\n'
         '        if (sub.pm) sub.pm.disable();\n'
         '        sub.setStyle({weight: 2, dashArray: null, color: color});\n'
+        '        if (f) sub.bindTooltip(f.name);\n'
         '      });\n'
         '    }\n'
         '    editingId = null;\n'
         '    document.getElementById("ed-edit-bar").style.display = "none";\n'
+        '    updateBuffer(prevId);\n'
         '  }\n'
         '  window.edStopEditing = function() { stopEditingInternal(); };\n'
         '\n'
@@ -1892,6 +1436,10 @@ def create_editable_map(gdf, validation_df):
         '    ctxTargetId = null;\n'
         '  }\n'
         '  document.addEventListener("click", function() { hideCtxMenu(); });\n'
+        '  window.edSidebarCtx = function(e, id) {\n'
+        '    e.preventDefault();\n'
+        '    showCtxMenu(e.clientX, e.clientY, id);\n'
+        '  };\n'
         '  window.edCtxEdit = function() {\n'
         '    var id = ctxTargetId;\n'
         '    hideCtxMenu();\n'
@@ -1906,6 +1454,7 @@ def create_editable_map(gdf, validation_df):
         '    if (editingId === id) stopEditingInternal();\n'
         '    var m = getMap();\n'
         '    if (m && layers[id] && m.hasLayer(layers[id])) m.removeLayer(layers[id]);\n'
+        '    if (m && bufferLayers[id] && m.hasLayer(bufferLayers[id])) m.removeLayer(bufferLayers[id]);\n'
         '    deletedIds[id] = true;\n'
         '    fState[id].checked = false;\n'
         '    edRenderList();\n'
@@ -2041,12 +1590,46 @@ def create_editable_map(gdf, validation_df):
         '  // --- Export checkbox (individual) ---\n'
         '  window.edToggleItem = function(id, on) {\n'
         '    fState[id].checked = on;\n'
+        '    if (bufferVisible && bufferLayers[id]) {\n'
+        '      var m = getMap();\n'
+        '      if (m) {\n'
+        '        if (on && !deletedIds[id]) { if (!m.hasLayer(bufferLayers[id])) bufferLayers[id].addTo(m); }\n'
+        '        else { if (m.hasLayer(bufferLayers[id])) m.removeLayer(bufferLayers[id]); }\n'
+        '      }\n'
+        '    }\n'
+        '    // Update the counter\n'
+        '    var checked = 0;\n'
+        '    for (var i = 0; i < facilities.length; i++) { if (fState[facilities[i].id].checked) checked++; }\n'
+        '    var countEl = document.getElementById("ed-count");\n'
+        '    if (countEl) {\n'
+        '      var parts = countEl.textContent.split(",");\n'
+        '      countEl.textContent = parts[0] + ", " + checked + " validated";\n'
+        '    }\n'
         '  };\n'
         '\n'
         '  // --- Hover-to-pan toggle ---\n'
         '  window.edSetHoverPan = function(on) {\n'
         '    hoverPanEnabled = on;\n'
         '    edRenderList();\n'
+        '  };\n'
+        '\n'
+        '  // --- Buffer toggle / radius ---\n'
+        '  window.edToggleBuffers = function(on) {\n'
+        '    bufferVisible = on;\n'
+        '    var m = getMap(); if (!m) return;\n'
+        '    for (var id in bufferLayers) {\n'
+        '      var nid = +id;\n'
+        '      if (on && fState[nid] && fState[nid].checked && !deletedIds[nid]) {\n'
+        '        if (!m.hasLayer(bufferLayers[id])) bufferLayers[id].addTo(m);\n'
+        '      } else {\n'
+        '        if (m.hasLayer(bufferLayers[id])) m.removeLayer(bufferLayers[id]);\n'
+        '      }\n'
+        '    }\n'
+        '  };\n'
+        '  window.edUpdateBufferRadius = function(miles) {\n'
+        '    if (!miles || miles <= 0) return;\n'
+        '    bufferRadiusMiles = miles;\n'
+        '    updateAllBuffers();\n'
         '  };\n'
         '\n'
         '  // --- Zoom / Pan ---\n'
@@ -2089,7 +1672,7 @@ def create_editable_map(gdf, validation_df):
         '        html += \'<input type="checkbox" title="Include in export"\' + chk + \' onchange="edToggleItem(\' + f.id + \',this.checked)">\';\n'
         '        html += \'<span class="ed-dot" style="background:\' + dotColor + \'"></span>\';\n'
         '        var hov = hoverPanEnabled ? \' onmouseenter="edPanTo(\' + f.id + \')"\'  : "";\n'
-        '        html += \'<span class="ed-fname"\' + hov + \' onclick="edZoomTo(\' + f.id + \')">\' + f.name + \'</span>\';\n'
+        '        html += \'<span class="ed-fname"\' + hov + \' onclick="edZoomTo(\' + f.id + \')" oncontextmenu="edSidebarCtx(event,\' + f.id + \')">\' + f.name + \'</span>\';\n'
         '        html += \'</div>\';\n'
         '        totalShown++;\n'
         '      }\n'
@@ -2097,7 +1680,7 @@ def create_editable_map(gdf, validation_df):
         '    list.innerHTML = html;\n'
         '    var checked = 0;\n'
         '    for (var i = 0; i < facilities.length; i++) { if (fState[facilities[i].id].checked) checked++; }\n'
-        '    countEl.textContent = totalShown + " shown, " + checked + " checked for export";\n'
+        '    countEl.textContent = totalShown + " shown, " + checked + " validated";\n'
         '  };\n'
         '\n'
         '  // --- Export ---\n'
@@ -2105,13 +1688,16 @@ def create_editable_map(gdf, validation_df):
         '    var features = [];\n'
         '    for (var i = 0; i < facilities.length; i++) {\n'
         '      var f = facilities[i];\n'
-        '      if (!fState[f.id].checked) continue;\n'
-        '      var layer = layers[f.id];\n'
-        '      if (!layer) continue;\n'
+        '      var isDeleted = !!deletedIds[f.id];\n'
+        '      var isChecked = !!fState[f.id].checked;\n'
         '      var geom = null;\n'
-        '      layer.eachLayer(function(sub) {\n'
-        '        if (sub.toGeoJSON) geom = sub.toGeoJSON().geometry;\n'
-        '      });\n'
+        '      var layer = layers[f.id];\n'
+        '      if (layer) {\n'
+        '        layer.eachLayer(function(sub) {\n'
+        '          if (sub.toGeoJSON) geom = sub.toGeoJSON().geometry;\n'
+        '        });\n'
+        '      }\n'
+        '      if (!geom) geom = f.geometry || null;\n'
         '      if (!geom) continue;\n'
         '      features.push({\n'
         '        type: "Feature",\n'
@@ -2120,25 +1706,60 @@ def create_editable_map(gdf, validation_df):
         '          category: f.category,\n'
         '          osm_id: f.osm_id,\n'
         '          fsq_id: f.fsq_id,\n'
-        '          _node_ids: f._node_ids || null\n'
+        '          _node_ids: f._node_ids || null,\n'
+        '          checked: isChecked,\n'
+        '          deleted: isDeleted,\n'
+        '          poi_lat: (f.poi_lat != null) ? f.poi_lat : null,\n'
+        '          poi_lon: (f.poi_lon != null) ? f.poi_lon : null,\n'
+        '          fsq_name: f.fsq_name || "",\n'
+        '          fsq_address: f.fsq_address || "",\n'
+        '          buffer_radius_miles: bufferRadiusMiles\n'
         '        },\n'
         '        geometry: geom\n'
         '      });\n'
         '    }\n'
-        '    if (features.length === 0 && Object.keys(deletedIds).length === 0) { alert("No facilities checked for export."); return; }\n'
-        '    var del = [];\n'
+        '    // Add buffer features for checked non-deleted facilities\n'
         '    for (var i = 0; i < facilities.length; i++) {\n'
-        '      var df = facilities[i];\n'
-        '      if (deletedIds[df.id]) del.push({osm_id: df.osm_id, fsq_id: df.fsq_id, name: df.name});\n'
+        '      var bf = facilities[i];\n'
+        '      if (!fState[bf.id].checked || deletedIds[bf.id]) continue;\n'
+        '      var bufGeom = null;\n'
+        '      if (bufferLayers[bf.id]) {\n'
+        '        bufferLayers[bf.id].eachLayer(function(sub) {\n'
+        '          if (sub.toGeoJSON) bufGeom = sub.toGeoJSON().geometry;\n'
+        '        });\n'
+        '      }\n'
+        '      if (!bufGeom) {\n'
+        '        var srcGeom = null;\n'
+        '        if (layers[bf.id]) layers[bf.id].eachLayer(function(sub) { if (sub.toGeoJSON) srcGeom = sub.toGeoJSON().geometry; });\n'
+        '        if (srcGeom) bufGeom = computeBufferGeom(srcGeom);\n'
+        '      }\n'
+        '      if (bufGeom) {\n'
+        '        features.push({\n'
+        '          type: "Feature",\n'
+        '          properties: {\n'
+        '            _is_buffer: true,\n'
+        '            _buffer_for_name: bf.name,\n'
+        '            _buffer_for_osm_id: bf.osm_id || "",\n'
+        '            buffer_radius_miles: bufferRadiusMiles\n'
+        '          },\n'
+        '          geometry: bufGeom\n'
+        '        });\n'
+        '      }\n'
         '    }\n'
-        '    var fc = {type: "FeatureCollection", features: features, _deleted: del};\n'
+        '    if (features.length === 0) { alert("No facilities to export."); return; }\n'
+        '    var fc = {type: "FeatureCollection", features: features, buffer_radius_miles: bufferRadiusMiles};\n'
         '    var blob = new Blob([JSON.stringify(fc, null, 2)], {type: "application/json"});\n'
         '    var url = URL.createObjectURL(blob);\n'
         '    var a = document.createElement("a");\n'
-        '    a.href = url; a.download = "nj_golf_courses_edited.geojson";\n'
+        '    a.href = url; a.download = "EDITED_GEOJSON_FILENAME";\n'
         '    document.body.appendChild(a); a.click();\n'
         '    document.body.removeChild(a); URL.revokeObjectURL(url);\n'
-        '    alert("Exported " + features.length + " facilities to GeoJSON.");\n'
+        '    var chk = 0, del = 0;\n'
+        '    for (var i = 0; i < features.length; i++) {\n'
+        '      if (features[i].properties.checked) chk++;\n'
+        '      if (features[i].properties.deleted) del++;\n'
+        '    }\n'
+        '    alert("Exported " + features.length + " facilities (" + chk + " checked, " + del + " deleted).");\n'
         '  };\n'
         '\n'
         '  // --- Import ---\n'
@@ -2151,6 +1772,32 @@ def create_editable_map(gdf, validation_df):
         '        var fc = JSON.parse(e.target.result);\n'
         '        if (!fc.features) { alert("Invalid GeoJSON: no features array."); return; }\n'
         '      } catch(err) { alert("Failed to parse GeoJSON: " + err.message); return; }\n'
+        '      // Restore buffer radius from FeatureCollection or first feature\n'
+        '      if (fc.buffer_radius_miles) {\n'
+        '        bufferRadiusMiles = fc.buffer_radius_miles;\n'
+        '        document.getElementById("ed-buffer-radius").value = bufferRadiusMiles;\n'
+        '      } else {\n'
+        '        for (var i = 0; i < fc.features.length; i++) {\n'
+        '          var bp = fc.features[i].properties || {};\n'
+        '          if (bp.buffer_radius_miles && !bp._is_buffer) {\n'
+        '            bufferRadiusMiles = bp.buffer_radius_miles;\n'
+        '            document.getElementById("ed-buffer-radius").value = bufferRadiusMiles;\n'
+        '            break;\n'
+        '          }\n'
+        '        }\n'
+        '      }\n'
+        '      // Filter out buffer features\n'
+        '      fc.features = fc.features.filter(function(ft) {\n'
+        '        return !(ft.properties && ft.properties._is_buffer);\n'
+        '      });\n'
+        '      // Detect format: new format has checked/deleted properties\n'
+        '      var isNewFormat = false;\n'
+        '      for (var i = 0; i < fc.features.length; i++) {\n'
+        '        var pp = fc.features[i].properties || {};\n'
+        '        if (pp.hasOwnProperty("checked") || pp.hasOwnProperty("deleted")) {\n'
+        '          isNewFormat = true; break;\n'
+        '        }\n'
+        '      }\n'
         '      // Build lookup indexes for matching\n'
         '      var byOsm = {}, byFsq = {}, byName = {};\n'
         '      for (var i = 0; i < facilities.length; i++) {\n'
@@ -2159,13 +1806,19 @@ def create_editable_map(gdf, validation_df):
         '        if (f.fsq_id) byFsq[f.fsq_id] = f;\n'
         '        byName[f.name] = f;\n'
         '      }\n'
-        '      var matched = 0, unmatched = 0;\n'
+        '      var matched = 0, created = 0;\n'
         '      var m = getMap();\n'
-        '      // Reset: uncheck everything, clear deletions\n'
-        '      for (var i = 0; i < facilities.length; i++) fState[facilities[i].id].checked = false;\n'
+        '      // Reset: uncheck everything, re-show deleted layers, clear deletions\n'
+        '      for (var i = 0; i < facilities.length; i++) {\n'
+        '        var fac = facilities[i];\n'
+        '        fState[fac.id].checked = false;\n'
+        '        if (m && layers[fac.id] && !m.hasLayer(layers[fac.id])) {\n'
+        '          layers[fac.id].addTo(m);\n'
+        '        }\n'
+        '      }\n'
         '      deletedIds = {};\n'
-        '      // Restore deletions from imported file\n'
-        '      if (fc._deleted && fc._deleted.length) {\n'
+        '      // Old format backward compat: process _deleted array\n'
+        '      if (!isNewFormat && fc._deleted && fc._deleted.length) {\n'
         '        for (var d = 0; d < fc._deleted.length; d++) {\n'
         '          var dd = fc._deleted[d];\n'
         '          var dt = null;\n'
@@ -2174,81 +1827,335 @@ def create_editable_map(gdf, validation_df):
         '          else if (dd.name && byName[dd.name]) dt = byName[dd.name];\n'
         '          if (dt) {\n'
         '            deletedIds[dt.id] = true;\n'
+        '            fState[dt.id].checked = false;\n'
         '            if (m && layers[dt.id] && m.hasLayer(layers[dt.id])) m.removeLayer(layers[dt.id]);\n'
         '          }\n'
         '        }\n'
         '      }\n'
+        '      // Process features\n'
         '      for (var j = 0; j < fc.features.length; j++) {\n'
         '        var feat = fc.features[j];\n'
         '        var p = feat.properties || {};\n'
-        '        // Match by osm_id, then fsq_id, then name\n'
         '        var target = null;\n'
         '        if (p.osm_id && byOsm[p.osm_id]) target = byOsm[p.osm_id];\n'
         '        else if (p.fsq_id && byFsq[p.fsq_id]) target = byFsq[p.fsq_id];\n'
         '        else if (p.name && byName[p.name]) target = byName[p.name];\n'
-        '        if (!target) { unmatched++; continue; }\n'
-        '        matched++;\n'
-        '        fState[target.id].checked = true;\n'
-        '        // Replace layer geometry with imported (possibly edited) geometry\n'
-        '        var oldLayer = layers[target.id];\n'
-        '        if (oldLayer && m) {\n'
-        '          var wasVisible = m.hasLayer(oldLayer);\n'
-        '          if (wasVisible) m.removeLayer(oldLayer);\n'
-        '          var color = (target.category === "verified") ? "#2563eb" : "#dc2626";\n'
-        '          var newGJ = {type:"Feature", geometry: feat.geometry, properties:{id:target.id, name:target.name}};\n'
-        '          var newLayer = L.geoJSON(newGJ, {\n'
+        '        if (target) {\n'
+        '          // Matched existing facility\n'
+        '          matched++;\n'
+        '          fState[target.id].checked = isNewFormat ? !!p.checked : true;\n'
+        '          if (isNewFormat && p.deleted) {\n'
+        '            deletedIds[target.id] = true;\n'
+        '            fState[target.id].checked = false;\n'
+        '            if (m && layers[target.id] && m.hasLayer(layers[target.id])) m.removeLayer(layers[target.id]);\n'
+        '          }\n'
+        '          // Replace geometry with imported version\n'
+        '          if (feat.geometry) {\n'
+        '            var oldLayer = layers[target.id];\n'
+        '            if (oldLayer && m) {\n'
+        '              var wasVisible = m.hasLayer(oldLayer);\n'
+        '              if (wasVisible) m.removeLayer(oldLayer);\n'
+        '              var color = (target.category === "verified") ? "#2563eb" : "#dc2626";\n'
+        '              var newGJ = {type:"Feature", geometry: feat.geometry, properties:{id:target.id, name:target.name}};\n'
+        '              var newLayer = L.geoJSON(newGJ, {\n'
+        '                style: {fillColor: color, color: color, weight: 2, fillOpacity: 0.3}\n'
+        '              });\n'
+        '              newLayer.eachLayer(function(sub) {\n'
+        '                sub.bindTooltip(target.name);\n'
+        '                var tid = target.id;\n'
+        '                sub.on("contextmenu", function(ev) {\n'
+        '                  L.DomEvent.preventDefault(ev);\n'
+        '                  showCtxMenu(ev.originalEvent.clientX, ev.originalEvent.clientY, tid);\n'
+        '                });\n'
+        '              });\n'
+        '              layers[target.id] = newLayer;\n'
+        '              if (wasVisible && !deletedIds[target.id]) newLayer.addTo(m);\n'
+        '            }\n'
+        '          }\n'
+        '          if (p.poi_lat != null) target.poi_lat = p.poi_lat;\n'
+        '          if (p.poi_lon != null) target.poi_lon = p.poi_lon;\n'
+        '          if (p.fsq_name) target.fsq_name = p.fsq_name;\n'
+        '          if (p.fsq_address) target.fsq_address = p.fsq_address;\n'
+        '          if (p._node_ids !== undefined) target._node_ids = p._node_ids;\n'
+        '        } else {\n'
+        '          // Unmatched: create new facility\n'
+        '          if (!feat.geometry) continue;\n'
+        '          created++;\n'
+        '          var newId = facilities.length > 0\n'
+        '            ? Math.max.apply(null, facilities.map(function(ff){return ff.id;})) + 1 : 0;\n'
+        '          var newF = {\n'
+        '            id: newId, name: p.name || ("Imported Course " + created),\n'
+        '            category: p.category || "fsq_only",\n'
+        '            checked: isNewFormat ? !!p.checked : true,\n'
+        '            geometry: feat.geometry,\n'
+        '            osm_id: p.osm_id || "", fsq_id: p.fsq_id || "",\n'
+        '            fsq_name: p.fsq_name || "",\n'
+        '            fsq_address: p.fsq_address || "",\n'
+        '            poi_lat: (p.poi_lat != null) ? p.poi_lat : null,\n'
+        '            poi_lon: (p.poi_lon != null) ? p.poi_lon : null,\n'
+        '            _node_ids: p._node_ids || null\n'
+        '          };\n'
+        '          facilities.push(newF);\n'
+        '          fState[newId] = {checked: newF.checked};\n'
+        '          if (newF.osm_id) byOsm[newF.osm_id] = newF;\n'
+        '          if (newF.fsq_id) byFsq[newF.fsq_id] = newF;\n'
+        '          byName[newF.name] = newF;\n'
+        '          var color = (newF.category === "verified") ? "#2563eb" : "#dc2626";\n'
+        '          var nf = {type:"Feature", geometry: feat.geometry, properties:{id:newId, name:newF.name}};\n'
+        '          var nl = L.geoJSON(nf, {\n'
         '            style: {fillColor: color, color: color, weight: 2, fillOpacity: 0.3}\n'
         '          });\n'
-        '          newLayer.eachLayer(function(sub) {\n'
-        '            sub.bindTooltip(target.name);\n'
-        '            var tid = target.id;\n'
-        '            sub.on("contextmenu", function(ev) {\n'
-        '              L.DomEvent.preventDefault(ev);\n'
-        '              showCtxMenu(ev.originalEvent.clientX, ev.originalEvent.clientY, tid);\n'
+        '          (function(cid, cname) {\n'
+        '            nl.eachLayer(function(sub) {\n'
+        '              sub.bindTooltip(cname);\n'
+        '              sub.on("contextmenu", function(ev) {\n'
+        '                L.DomEvent.preventDefault(ev);\n'
+        '                showCtxMenu(ev.originalEvent.clientX, ev.originalEvent.clientY, cid);\n'
+        '              });\n'
         '            });\n'
-        '          });\n'
-        '          layers[target.id] = newLayer;\n'
-        '          if (wasVisible) newLayer.addTo(m);\n'
+        '          })(newId, newF.name);\n'
+        '          layers[newId] = nl;\n'
+        '          if (isNewFormat && p.deleted) {\n'
+        '            deletedIds[newId] = true;\n'
+        '            fState[newId].checked = false;\n'
+        '          } else if (m) {\n'
+        '            nl.addTo(m);\n'
+        '          }\n'
         '        }\n'
         '      }\n'
         '      edRenderList();\n'
-        '      alert("Imported " + matched + " facilities."\n'
-        '        + (unmatched > 0 ? " (" + unmatched + " could not be matched.)" : ""));\n'
+        '      updateAllBuffers();\n'
+        '      var msg = "Imported " + matched + " matched facilities.";\n'
+        '      if (created > 0) msg += " Created " + created + " new.";\n'
+        '      alert(msg);\n'
         '    };\n'
         '    reader.readAsText(file);\n'
-        '    input.value = "";  // reset so same file can be re-imported\n'
+        '    input.value = "";\n'
+        '  };\n'
+        '\n'
+        '  // --- Geodesic area helper (Shoelace on spherical excess) ---\n'
+        '  function geodesicArea(coords) {\n'
+        '    // coords: array of [lon, lat] pairs (closed ring)\n'
+        '    var R = 6371000; // Earth radius in meters\n'
+        '    var n = coords.length;\n'
+        '    if (n < 4) return 0;\n'
+        '    var total = 0;\n'
+        '    for (var i = 0; i < n - 1; i++) {\n'
+        '      var j = (i + 1) % (n - 1);\n'
+        '      var lat1 = coords[i][1] * Math.PI / 180;\n'
+        '      var lat2 = coords[j][1] * Math.PI / 180;\n'
+        '      var dlon = (coords[j][0] - coords[i][0]) * Math.PI / 180;\n'
+        '      total += dlon * (2 + Math.sin(lat1) + Math.sin(lat2));\n'
+        '    }\n'
+        '    return Math.abs(total * R * R / 2);\n'
+        '  }\n'
+        '\n'
+        '  function computeCentroid(coords) {\n'
+        '    // coords: array of [lon, lat] (closed ring) — simple average\n'
+        '    var n = coords.length - 1; // exclude closing vertex\n'
+        '    if (n <= 0) return [0, 0];\n'
+        '    var sumLon = 0, sumLat = 0;\n'
+        '    for (var i = 0; i < n; i++) { sumLon += coords[i][0]; sumLat += coords[i][1]; }\n'
+        '    return [sumLon / n, sumLat / n];\n'
+        '  }\n'
+        '\n'
+        '  // --- CSV Export ---\n'
+        '  function csvEscape(val) {\n'
+        '    var s = String(val == null ? "" : val);\n'
+        '    if (s.indexOf(",") >= 0 || s.indexOf(\'"\') >= 0 || s.indexOf("\\n") >= 0) {\n'
+        '      return \'"\' + s.replace(/"/g, \'""\') + \'"\';\n'
+        '    }\n'
+        '    return s;\n'
+        '  }\n'
+        '  window.edExportCSV = function() {\n'
+        '    var header = ["name","category","area_sq_meters","area_acres","poi_latitude","poi_longitude","centroid_latitude","centroid_longitude","osm_id","foursquare_verified","foursquare_name","foursquare_fsq_place_id","foursquare_address"];\n'
+        '    var rows = [header.join(",")];\n'
+        '    for (var i = 0; i < facilities.length; i++) {\n'
+        '      var f = facilities[i];\n'
+        '      if (!fState[f.id].checked || deletedIds[f.id]) continue;\n'
+        '      var layer = layers[f.id];\n'
+        '      if (!layer) continue;\n'
+        '      var geom = null;\n'
+        '      layer.eachLayer(function(sub) { if (sub.toGeoJSON) geom = sub.toGeoJSON().geometry; });\n'
+        '      if (!geom) continue;\n'
+        '      // Compute area and centroid from geometry\n'
+        '      var areaSqM = 0, centLon = 0, centLat = 0;\n'
+        '      if (geom.type === "Polygon") {\n'
+        '        areaSqM = geodesicArea(geom.coordinates[0]);\n'
+        '        var c = computeCentroid(geom.coordinates[0]);\n'
+        '        centLon = c[0]; centLat = c[1];\n'
+        '      } else if (geom.type === "MultiPolygon") {\n'
+        '        var totalArea = 0;\n'
+        '        var wLon = 0, wLat = 0;\n'
+        '        for (var p = 0; p < geom.coordinates.length; p++) {\n'
+        '          var pArea = geodesicArea(geom.coordinates[p][0]);\n'
+        '          totalArea += pArea;\n'
+        '          var pc = computeCentroid(geom.coordinates[p][0]);\n'
+        '          wLon += pc[0] * pArea; wLat += pc[1] * pArea;\n'
+        '        }\n'
+        '        areaSqM = totalArea;\n'
+        '        if (totalArea > 0) { centLon = wLon / totalArea; centLat = wLat / totalArea; }\n'
+        '      }\n'
+        '      var areaAcres = areaSqM * 0.000247105;\n'
+        '      var poiLat = (f.poi_lat != null) ? f.poi_lat : "";\n'
+        '      var poiLon = (f.poi_lon != null) ? f.poi_lon : "";\n'
+        '      var fsqVerified = (f.category === "verified");\n'
+        '      var row = [\n'
+        '        csvEscape(f.name), csvEscape(f.category),\n'
+        '        areaSqM.toFixed(2), areaAcres.toFixed(2),\n'
+        '        poiLat ? Number(poiLat).toFixed(6) : "",\n'
+        '        poiLon ? Number(poiLon).toFixed(6) : "",\n'
+        '        centLat.toFixed(6), centLon.toFixed(6),\n'
+        '        csvEscape(f.osm_id), fsqVerified,\n'
+        '        csvEscape(f.fsq_name || ""), csvEscape(f.fsq_id || ""), csvEscape(f.fsq_address || "")\n'
+        '      ];\n'
+        '      rows.push(row.join(","));\n'
+        '    }\n'
+        '    if (rows.length <= 1) { alert("No facilities checked for export."); return; }\n'
+        '    var blob = new Blob([rows.join("\\n")], {type: "text/csv"});\n'
+        '    var url = URL.createObjectURL(blob);\n'
+        '    var a = document.createElement("a");\n'
+        '    a.href = url; a.download = "EDITED_CSV_FILENAME";\n'
+        '    document.body.appendChild(a); a.click();\n'
+        '    document.body.removeChild(a); URL.revokeObjectURL(url);\n'
+        '    alert("Exported " + (rows.length - 1) + " facilities to CSV.");\n'
+        '  };\n'
+        '\n'
+        '  // --- Add Course modal ---\n'
+        '  function makeHexagonJS(lat, lon, radiusM) {\n'
+        '    radiusM = radiusM || 75;\n'
+        '    var latOff = radiusM / 111000;\n'
+        '    var lonOff = radiusM / (111000 * Math.cos(lat * Math.PI / 180));\n'
+        '    var coords = [];\n'
+        '    for (var i = 0; i < 6; i++) {\n'
+        '      var angle = (60 * i - 30) * Math.PI / 180;\n'
+        '      coords.push([lon + lonOff * Math.cos(angle), lat + latOff * Math.sin(angle)]);\n'
+        '    }\n'
+        '    coords.push(coords[0].slice());\n'
+        '    return {type: "Polygon", coordinates: [coords]};\n'
+        '  }\n'
+        '  window.edAddOpen = function() {\n'
+        '    document.getElementById("ed-add-name").value = "";\n'
+        '    document.getElementById("ed-add-lat").value = "";\n'
+        '    document.getElementById("ed-add-lon").value = "";\n'
+        '    document.getElementById("ed-add-dup-warn").style.display = "none";\n'
+        '    document.getElementById("ed-add-modal").classList.add("ed-show");\n'
+        '  };\n'
+        '  window.edAddClose = function() {\n'
+        '    document.getElementById("ed-add-modal").classList.remove("ed-show");\n'
+        '  };\n'
+        '  window.edAddCheckDup = function() {\n'
+        '    var name = document.getElementById("ed-add-name").value.trim().toLowerCase();\n'
+        '    var warn = document.getElementById("ed-add-dup-warn");\n'
+        '    if (!name) { warn.style.display = "none"; return; }\n'
+        '    for (var i = 0; i < facilities.length; i++) {\n'
+        '      if (deletedIds[facilities[i].id]) continue;\n'
+        '      if (facilities[i].name.toLowerCase() === name) {\n'
+        '        warn.textContent = "A course with this name already exists: " + facilities[i].name;\n'
+        '        warn.style.display = "block";\n'
+        '        return;\n'
+        '      }\n'
+        '    }\n'
+        '    warn.style.display = "none";\n'
+        '  };\n'
+        '  window.edAddSubmit = function() {\n'
+        '    var name = document.getElementById("ed-add-name").value.trim();\n'
+        '    var latStr = document.getElementById("ed-add-lat").value.trim();\n'
+        '    var lonStr = document.getElementById("ed-add-lon").value.trim();\n'
+        '    if (!name) { alert("Name is required."); return; }\n'
+        '    if (!latStr || !lonStr) { alert("Latitude and Longitude are required."); return; }\n'
+        '    var lat = parseFloat(latStr), lon = parseFloat(lonStr);\n'
+        '    if (isNaN(lat) || isNaN(lon)) { alert("Invalid coordinates."); return; }\n'
+        '    // Bounds check\n'
+        '    if (lat < BOUNDS_MIN_LAT || lat > BOUNDS_MAX_LAT || lon < BOUNDS_MIN_LON || lon > BOUNDS_MAX_LON) {\n'
+        '      if (!confirm("These coordinates appear to be outside the expected area (lat BOUNDS_MIN_LAT\\u2013BOUNDS_MAX_LAT, lon BOUNDS_MIN_LON\\u2013BOUNDS_MAX_LON). Continue anyway?")) return;\n'
+        '    }\n'
+        '    var hexGeom = makeHexagonJS(lat, lon);\n'
+        '    var newId = facilities.length > 0 ? Math.max.apply(null, facilities.map(function(f){return f.id;})) + 1 : 0;\n'
+        '    var newF = {\n'
+        '      id: newId, name: name, category: "fsq_only", checked: true,\n'
+        '      geometry: hexGeom, osm_id: "", fsq_id: "", fsq_name: "", fsq_address: "", poi_lat: lat, poi_lon: lon, _node_ids: null\n'
+        '    };\n'
+        '    facilities.push(newF);\n'
+        '    fState[newId] = {checked: true};\n'
+        '    // Create Leaflet layer\n'
+        '    var m = getMap();\n'
+        '    var color = "#dc2626";\n'
+        '    var feat = {type:"Feature", geometry: hexGeom, properties:{id:newId, name:name}};\n'
+        '    var layer = L.geoJSON(feat, {\n'
+        '      style: {fillColor: color, color: color, weight: 2, fillOpacity: 0.3}\n'
+        '    });\n'
+        '    layer.eachLayer(function(sub) {\n'
+        '      sub.bindTooltip(name);\n'
+        '      sub.on("contextmenu", function(ev) {\n'
+        '        L.DomEvent.preventDefault(ev);\n'
+        '        showCtxMenu(ev.originalEvent.clientX, ev.originalEvent.clientY, newId);\n'
+        '      });\n'
+        '    });\n'
+        '    layers[newId] = layer;\n'
+        '    if (m) {\n'
+        '      layer.addTo(m);\n'
+        '      var bounds = layer.getBounds();\n'
+        '      if (bounds.isValid()) m.fitBounds(bounds, {maxZoom: 16, padding: [40, 40]});\n'
+        '    }\n'
+        '    edAddClose();\n'
+        '    edRenderList();\n'
+        '    updateBuffer(newId);\n'
+        '    alert("Added " + name + ". Right-click the hexagon to edit its shape.");\n'
+        '  };\n'
+        '\n'
+        '  // --- Help modal ---\n'
+        '  window.edHelpOpen = function() {\n'
+        '    document.getElementById("ed-help-modal").classList.add("ed-show");\n'
+        '  };\n'
+        '  window.edHelpClose = function() {\n'
+        '    document.getElementById("ed-help-modal").classList.remove("ed-show");\n'
         '  };\n'
         '\n'
         '  // --- Keyboard shortcut ---\n'
         '  document.addEventListener("keydown", function(e) {\n'
-        '    if (e.key === "Escape" && editingId !== null) stopEditingInternal();\n'
+        '    if (e.key === "Escape") {\n'
+        '      if (document.getElementById("ed-help-modal").classList.contains("ed-show")) { edHelpClose(); return; }\n'
+        '      if (document.getElementById("ed-add-modal").classList.contains("ed-show")) { edAddClose(); return; }\n'
+        '      if (editingId !== null) stopEditingInternal();\n'
+        '    }\n'
         '  });\n'
         '\n'
         '  // --- Init ---\n'
         '  setTimeout(function() {\n'
         '    initLayers();\n'
         '    edRenderList();\n'
+        '    updateAllBuffers();\n'
         '  }, 800);\n'
         '})();\n'
         '</script>\n'
         '{% endmacro %}'
-    ).replace("FACILITIES_JSON", facilities_json)
+    ).replace("FACILITIES_JSON", facilities_json
+    ).replace("GUIDE_HTML_PLACEHOLDER", guide_html
+    ).replace("BOUNDS_MIN_LAT", str(bounds_min_lat)
+    ).replace("BOUNDS_MAX_LAT", str(bounds_max_lat)
+    ).replace("BOUNDS_MIN_LON", str(bounds_min_lon)
+    ).replace("BOUNDS_MAX_LON", str(bounds_max_lon)
+    ).replace("EDITED_GEOJSON_FILENAME", config.file_path("edited.geojson")
+    ).replace("EDITED_CSV_FILENAME", config.file_path("edited.csv"))
 
     sidebar = MacroElement()
     sidebar._template = Template(editable_tpl)
     m.get_root().add_child(sidebar)
 
-    map_path = os.path.join(DATA_DIR, "nj_golf_courses_editable.html")
+    map_path = os.path.join(DATA_DIR, config.file_path("editable.html"))
     m.save(map_path)
     print(f"  Editable map saved to {map_path}")
     return m
 
 
-def create_tables(gdf, fsq_validation, web_validation=None, fsq_df=None):
+def create_tables(gdf, fsq_validation, config=None, fsq_df=None):
     """Generate summary CSV table with POI and centroid coordinates."""
-    print("[6/7] Generating summary tables...")
+    if config is None:
+        config = PipelineConfig()
+    print("[5/5] Generating summary tables...")
 
-    gdf_projected = gdf.to_crs(UTM_CRS)
+    gdf_projected = gdf.to_crs(config.utm_crs)
     gdf_centroids = gdf_projected.geometry.centroid.to_crs("EPSG:4326")
 
     records = []
@@ -2285,19 +2192,6 @@ def create_tables(gdf, fsq_validation, web_validation=None, fsq_df=None):
                         poi_lat = fsq_match.iloc[0]["latitude"]
                         poi_lon = fsq_match.iloc[0]["longitude"]
 
-        # Web validation info
-        web_validated = False
-        course_type = "unknown"
-        status = "unknown"
-        if web_validation is not None and not web_validation.empty:
-            web_match = web_validation[web_validation["name"] == name]
-            if not web_match.empty:
-                w = web_match.iloc[0]
-                if w["course_type"] != "unknown" or w["status"] != "unknown":
-                    web_validated = True
-                course_type = w["course_type"]
-                status = w["status"]
-
         category = "verified" if fsq_verified else "osm_only"
 
         records.append(
@@ -2314,9 +2208,6 @@ def create_tables(gdf, fsq_validation, web_validation=None, fsq_df=None):
                 "foursquare_verified": fsq_verified,
                 "foursquare_name": fsq_name,
                 "foursquare_fsq_place_id": fsq_place_id,
-                "web_validated": web_validated,
-                "course_type": course_type,
-                "status": status,
             }
         )
 
@@ -2342,20 +2233,17 @@ def create_tables(gdf, fsq_validation, web_validation=None, fsq_df=None):
                     "foursquare_verified": False,
                     "foursquare_name": row.get("foursquare_name", ""),
                     "foursquare_fsq_place_id": row.get("foursquare_fsq_place_id", ""),
-                    "web_validated": False,
-                    "course_type": "unknown",
-                    "status": "unknown",
                 }
             )
 
     summary_df = pd.DataFrame(records)
-    csv_path = os.path.join(DATA_DIR, "nj_golf_courses_table.csv")
+    csv_path = os.path.join(DATA_DIR, config.file_path("table.csv"))
     summary_df.to_csv(csv_path, index=False)
     print(f"  Saved summary table ({len(summary_df)} courses) to {csv_path}")
     return summary_df
 
 
-def export_to_josm(geojson_path, original_geojson_path=None):
+def export_to_josm(geojson_path, original_geojson_path=None, config=None):
     """Convert an edited GeoJSON file to .osm XML for import into JOSM.
 
     Reads the edited GeoJSON (exported from the editable map), compares it
@@ -2365,12 +2253,15 @@ def export_to_josm(geojson_path, original_geojson_path=None):
     Args:
         geojson_path: Path to the edited GeoJSON file.
         original_geojson_path: Path to the original GeoJSON for change detection.
-            Defaults to data/nj_golf_courses.geojson.
+            Defaults to data/<file_prefix>_data.geojson.
+        config: PipelineConfig instance (defaults to NJ golf courses).
     """
     import xml.etree.ElementTree as ET
 
+    if config is None:
+        config = PipelineConfig()
     if original_geojson_path is None:
-        original_geojson_path = os.path.join(DATA_DIR, "nj_golf_courses.geojson")
+        original_geojson_path = os.path.join(DATA_DIR, config.file_path("data.geojson"))
 
     # --- 1. Load data ---
     print(f"[JOSM Export] Loading edited GeoJSON: {geojson_path}")
@@ -2460,7 +2351,7 @@ def export_to_josm(geojson_path, original_geojson_path=None):
                 way_el = ET.SubElement(osm_root, "way", id=str(way_id))
                 for ref in node_refs:
                     ET.SubElement(way_el, "nd", ref=str(ref))
-                ET.SubElement(way_el, "tag", k="leisure", v="golf_course")
+                ET.SubElement(way_el, "tag", k=config.osm_tag, v=config.osm_value)
                 if name:
                     ET.SubElement(way_el, "tag", k="name", v=name)
                 ET.SubElement(way_el, "tag", k="source",
@@ -2581,7 +2472,7 @@ def export_to_josm(geojson_path, original_geojson_path=None):
         stats["skipped"] += 1
 
     # --- 4. Write output ---
-    output_path = os.path.join(DATA_DIR, "nj_golf_courses_josm.osm")
+    output_path = os.path.join(DATA_DIR, config.file_path("josm.osm"))
     tree = ET.ElementTree(osm_root)
     ET.indent(tree, space="  ")
     with open(output_path, "wb") as f:
@@ -2595,10 +2486,13 @@ def export_to_josm(geojson_path, original_geojson_path=None):
     return output_path
 
 
-def main():
+def main(config=None):
     """Run the full pipeline."""
+    if config is None:
+        config = PipelineConfig()
+
     print("=" * 60)
-    print("NJ Golf Course Mapper & Validator")
+    print(f"{config.display_name} Mapper & Validator")
     print("=" * 60)
     print()
 
@@ -2608,7 +2502,7 @@ def main():
 
     # Step 1: Fetch OSM data
     try:
-        osm_gdf = fetch_osm_golf_courses()
+        osm_gdf = fetch_osm_golf_courses(config)
     except Exception as e:
         print(f"  ERROR fetching OSM data: {e}")
         errors.append(f"OSM fetch: {e}")
@@ -2618,7 +2512,7 @@ def main():
 
     # Step 2: Fetch Foursquare data
     try:
-        fsq_df = fetch_foursquare_golf_courses()
+        fsq_df = fetch_foursquare_golf_courses(config)
     except Exception as e:
         print(f"  ERROR fetching Foursquare data: {e}")
         errors.append(f"Foursquare fetch: {e}")
@@ -2630,7 +2524,7 @@ def main():
 
     # Step 3: Cross-validate
     try:
-        fsq_validation = validate_with_foursquare(osm_gdf, fsq_df)
+        fsq_validation = validate_with_foursquare(osm_gdf, fsq_df, config)
     except Exception as e:
         print(f"  ERROR in Foursquare validation: {e}")
         errors.append(f"Foursquare validation: {e}")
@@ -2638,55 +2532,26 @@ def main():
 
     print()
 
-    # Step 3b: Validate Foursquare-only POIs with land cover analysis (V1)
+    # Step 4: Create maps
     try:
-        fsq_validation = validate_foursquare_only(osm_gdf, fsq_validation)
-    except Exception as e:
-        print(f"  ERROR in Foursquare-only V1 validation: {e}")
-        errors.append(f"Foursquare-only V1 validation: {e}")
-
-    print()
-
-    # Step 3c: V2 building-based directional ellipse validation
-    try:
-        fsq_validation = validate_foursquare_only_v2(osm_gdf, fsq_validation, fsq_df)
-    except Exception as e:
-        print(f"  ERROR in Foursquare-only V2 validation: {e}")
-        errors.append(f"Foursquare-only V2 validation: {e}")
-
-    print()
-
-    # Step 4: Web validation
-    try:
-        web_validation = validate_with_web(osm_gdf)
-    except Exception as e:
-        print(f"  ERROR in web validation: {e}")
-        errors.append(f"Web validation: {e}")
-        web_validation = None
-
-    print()
-
-    # Step 5: Create map
-    try:
-        create_map(osm_gdf, fsq_validation, web_validation)
+        create_map(osm_gdf, fsq_validation, config)
     except Exception as e:
         print(f"  ERROR creating map: {e}")
         errors.append(f"Map creation: {e}")
 
     print()
 
-    # Step 5b: Create editable map
     try:
-        create_editable_map(osm_gdf, fsq_validation)
+        create_editable_map(osm_gdf, fsq_validation, config, fsq_df=fsq_df)
     except Exception as e:
         print(f"  ERROR creating editable map: {e}")
         errors.append(f"Editable map creation: {e}")
 
     print()
 
-    # Step 6 & 7: Create summary tables
+    # Step 5: Create summary tables
     try:
-        summary = create_tables(osm_gdf, fsq_validation, web_validation, fsq_df)
+        summary = create_tables(osm_gdf, fsq_validation, config, fsq_df)
     except Exception as e:
         print(f"  ERROR creating tables: {e}")
         errors.append(f"Table creation: {e}")
@@ -2698,26 +2563,14 @@ def main():
     print("=" * 60)
     print("PIPELINE COMPLETE")
     print("=" * 60)
-    print(f"Total golf courses found (OSM): {len(osm_gdf)}")
-    print(f"Foursquare courses found: {len(fsq_df)}")
+    print(f"Total {config.keyword.lower()}s found (OSM): {len(osm_gdf)}")
+    print(f"Foursquare {config.keyword.lower()}s found: {len(fsq_df)}")
 
     if not fsq_validation.empty:
         matched = len(fsq_validation[fsq_validation["foursquare_match"] == True])
         total = len(fsq_validation[fsq_validation["osm_id"] != ""])
         if total > 0:
             print(f"Foursquare match rate: {matched}/{total} ({matched/total*100:.1f}%)")
-        if "golf_probability" in fsq_validation.columns:
-            fsq_only = fsq_validation[fsq_validation["match_method"] == "foursquare_only"]
-            likely = fsq_only[fsq_only["golf_probability"] >= 0.5]
-            print(f"Foursquare-only likely golf courses (V1 land cover): {len(likely)}/{len(fsq_only)}")
-        if "golf_probability_v2" in fsq_validation.columns:
-            fsq_only = fsq_validation[fsq_validation["match_method"] == "foursquare_only"]
-            likely_v2 = fsq_only[fsq_only["golf_probability_v2"] >= 0.5]
-            print(f"Foursquare-only likely golf courses (V2 building):   {len(likely_v2)}/{len(fsq_only)}")
-
-    if summary is not None:
-        web_val = summary[summary["web_validated"] == True]
-        print(f"Web-validated courses: {len(web_val)}")
 
     if errors:
         print(f"\nErrors encountered ({len(errors)}):")
@@ -2739,7 +2592,7 @@ if __name__ == "__main__":
         if idx + 1 < len(sys.argv):
             edited_path = sys.argv[idx + 1]
         else:
-            edited_path = os.path.join(DATA_DIR, "nj_golf_courses_edited.geojson")
+            edited_path = os.path.join(DATA_DIR, PipelineConfig().file_path("edited.geojson"))
         original_path = None
         if "--original" in sys.argv:
             oi = sys.argv.index("--original")
