@@ -47,7 +47,7 @@ When **unchecked**, the map will not move on hover — you must click a course n
 Each row in the list has:
 - A **checkbox** on the left — this controls whether the course is included when you export
 - A **color dot** matching the polygon color on the map
-- The **course name** — click it to zoom to that course on the map
+- The **course name** — click it to zoom to that course on the map; **right-click** it to open the context menu (Rename, Verify, Edit Shape, Simplify, Delete)
 
 ---
 
@@ -59,9 +59,10 @@ A suggested workflow for reviewing all courses:
 2. **Uncheck the categories you're not reviewing yet** — for example, uncheck "Verified" and "Foursquare Only" to focus on "OSM Only" first
 3. **Move your mouse down the list** — the map will pan to each course as you hover over its name
 4. **For each course:**
-   - If it looks correct and should be included: **check its checkbox**
-   - If the polygon shape needs fixing: **right-click the polygon on the map** and choose **Edit Shape** (see "Editing a Polygon" below), then check its checkbox
-   - If it's not a real golf course or should be excluded: **leave it unchecked**, or **right-click > Delete** to remove it entirely
+   - If it looks correct and should be included: **right-click > Verify** to mark it as verified (turns blue, auto-checked for export)
+   - If the polygon shape needs fixing: **right-click > Edit Shape** (see "Editing a Polygon" below), then verify it
+   - If the name is wrong: **right-click > Rename** to correct it
+   - If it's not a real golf course or should be excluded: **leave it unchecked**, or **right-click > Delete** to remove it entirely, or hover over it and press **Delete** on your keyboard
 5. **Repeat for the other categories**
 
 ---
@@ -85,15 +86,44 @@ Your changes are preserved — when you export, the updated shape will be saved.
 
 ---
 
+## Verifying / Unverifying a Course
+
+To confirm that a course is valid and should be included in exports:
+
+1. **Right-click** on the polygon (on the map or in the sidebar list)
+2. Click **"Verify"**
+3. The polygon turns **blue** and moves to the Verified category
+4. The course is automatically **checked** for export
+
+To reverse this, right-click again and click **"Unverify"** — the polygon turns red and moves back to its original category. The checked state is not changed when unverifying, so you can uncheck it manually if needed.
+
+---
+
+## Renaming a Course
+
+1. **Right-click** on the polygon (on the map or in the sidebar list)
+2. Click **"Rename"**
+3. Enter the new name in the prompt
+4. If another course already has that name, you'll be warned and can choose to proceed or cancel
+
+The rename updates the sidebar, the map tooltip, and all exports.
+
+---
+
 ## Deleting a Course
 
 If a polygon does not represent a real golf course and should be permanently removed:
 
-1. **Right-click** on the polygon on the map
+**Option A — Right-click menu:**
+1. **Right-click** on the polygon on the map (or its name in the sidebar)
 2. Click **"Delete"** (highlighted in red)
-3. The polygon is removed from both the map and the sidebar list
 
-Deleted courses will not appear in exports. If you import the exported file later, the deletions will be preserved.
+**Option B — Keyboard shortcut:**
+1. **Hover** your mouse over the polygon on the map
+2. Press the **Delete** key on your keyboard
+3. The course is deleted immediately (no confirmation prompt)
+
+In both cases the polygon is removed from the map and the sidebar list. Deleted courses will not appear in exports. If you import the exported file later, the deletions will be preserved.
 
 **Note:** There is no undo for delete within a session. If you delete something by mistake, you can reload the page to start fresh (you'll lose other unsaved work), or simply avoid exporting and reload.
 
@@ -107,7 +137,7 @@ When you're ready to save your progress:
 2. A file named `nj_golf_courses_edited.geojson` will download to your computer
 3. An alert will confirm how many courses were exported
 
-**Only checked courses are included in the export.** Unchecked and deleted courses are excluded. Any polygon edits you made (dragged vertices, reshaped boundaries) are saved in the exported file.
+**Only checked (validated) courses are included in the export.** Unchecked and deleted courses are excluded. Any polygon edits you made (dragged vertices, reshaped boundaries) are saved in the exported file.
 
 The exported file also remembers which courses you deleted, so they won't reappear when you import later.
 
@@ -137,7 +167,7 @@ You can import and export as many times as you like. Each export is a complete s
 
 - **Use Google Satellite view** to verify polygon boundaries against real aerial imagery. Click the layer icon in the top-right corner of the map to switch between map styles.
 - **Foursquare Only courses appear as small hexagons.** These are placeholder shapes centered on the Foursquare location. To include one, right-click it, choose "Edit Shape", and drag the vertices to trace the actual course boundary on the satellite view. Then check its checkbox.
-- **The status bar** below the search box shows how many courses are visible and how many are checked for export — use it to track your progress.
+- **The status bar** below the search box shows how many courses are visible and how many are validated — use it to track your progress.
 - **Export often.** There is no auto-save. If your browser crashes or you accidentally close the tab, unsaved work is lost.
 - **You can share the exported GeoJSON file** with others. They can import it into their own copy of the editable map to review or continue your work.
 
@@ -152,8 +182,13 @@ You can import and export as many times as you like. Each export is a complete s
 | Zoom to a course | Click its name in the sidebar |
 | Pan to a course (quick scan) | Hover over its name (when "Hover to Pan" is on) |
 | Mark a course for export | Check its checkbox in the sidebar |
-| Edit a polygon's shape | Right-click the polygon on the map > "Edit Shape" |
+| Verify a course | Right-click > "Verify" (turns blue, auto-checked) |
+| Unverify a course | Right-click > "Unverify" |
+| Rename a course | Right-click > "Rename" |
+| Edit a polygon's shape | Right-click > "Edit Shape" |
 | Finish editing | Right-click again, press Escape, or click "Done" |
-| Delete a course | Right-click the polygon > "Delete" |
+| Delete a course (menu) | Right-click > "Delete" |
+| Delete a course (keyboard) | Hover over polygon + press Delete key |
 | Save your work | Click "Export GeoJSON" |
+| Export checked to CSV | Click "Export Checked to CSV" |
 | Resume previous work | Click "Import GeoJSON" and select your saved file |
